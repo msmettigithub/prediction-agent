@@ -112,6 +112,7 @@ Dashboard Commands tab -> direct insert to agent_commands table
 This chat -> Claude creates Saturn job to inject into agent_commands DB
 
 ## Tool Experiments
+- 2026-04-07 17:16: polymarket-py: SKIP — polymarket-py is a Python library for Polymarket, not Kalshi. These are two sepa
 - 2026-04-07 17:07: gnews: USEFUL — GNews provides alternative news feeds that can supply real-time and recent news 
 - 2026-04-07 16:55: beautifulsoup4: USEFUL — BeautifulSoup4 can scrape RealClearPolitics poll aggregates to extract polling a
 - 2026-04-07 09:36: scipy: USEFUL — SciPy provides signal processing and statistical tools that can be applied to hi
