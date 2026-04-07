@@ -112,6 +112,7 @@ Dashboard Commands tab -> direct insert to agent_commands table
 This chat -> Claude creates Saturn job to inject into agent_commands DB
 
 ## Tool Experiments
+- 2026-04-07 09:26: alpha_vantage: SKIP — Alpha Vantage provides traditional economic indicators (GDP, CPI, unemployment, 
 - 2026-04-07 09:17: pandas-ta: USEFUL — pandas-ta provides technical analysis indicators (RSI, MACD, Bollinger Bands, et
 - 2026-04-07 09:08: textblob: SKIP — TextBlob provides basic rule-based sentiment polarity and subjectivity scores de
 - 2026-04-07 08:59: vaderSentiment: USEFUL — VADER sentiment analysis can provide supplementary signal for Kalshi prediction 
