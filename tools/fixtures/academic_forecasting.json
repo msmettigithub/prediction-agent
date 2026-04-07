@@ -1,0 +1,26 @@
+{
+  "papers": [
+    {
+      "paperId": "abc123",
+      "title": "Superforecasting and the Base Rate: How Calibrated Predictions Improve Decision Making",
+      "abstract": "We analyze 25,000 forecasts from the Good Judgment Project and find that superforecasters achieve 78% accuracy by anchoring to base rates and adjusting incrementally. The average base rate for binary geopolitical events is 32%, and the most common error is overweighting recent news by approximately 15 percentage points.",
+      "year": 2023,
+      "citationCount": 145,
+      "url": "https://api.semanticscholar.org/graph/v1/paper/abc123",
+      "authors": [{"name": "Philip Tetlock"}, {"name": "Barbara Mellers"}],
+      "cited_base_rates": ["32%", "78%", "15 percentage points"]
+    },
+    {
+      "paperId": "def456",
+      "title": "Prediction Market Calibration: Evidence from Political and Economic Contracts",
+      "abstract": "Using data from 12,000 resolved prediction market contracts, we find that market prices are well-calibrated for events with probability 20-80% but systematically overestimate tail probabilities. Contracts priced at 90% resolve YES only 82% of the time, supporting probability ceiling adjustments of approximately 7 percentage points.",
+      "year": 2024,
+      "citationCount": 89,
+      "url": "https://api.semanticscholar.org/graph/v1/paper/def456",
+      "authors": [{"name": "Robin Hanson"}, {"name": "Wei Zhan"}],
+      "cited_base_rates": ["82%", "90%", "7 percentage points", "20-80%"]
+    }
+  ],
+  "query": "superforecasting base rates prediction market calibration",
+  "total_results": 2
+}

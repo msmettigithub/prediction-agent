@@ -1,0 +1,22 @@
+{
+  "category_history": {
+    "category": "economics",
+    "total_contracts": 12,
+    "resolved_contracts": 8,
+    "model_accuracy": 0.75,
+    "avg_brier": 0.18,
+    "base_rate_yes": 0.625
+  },
+  "similar_contracts": [
+    {
+      "id": 1,
+      "title": "Will the Fed hold rates through Dec 2025?",
+      "similarity": 0.72,
+      "model_prob": 0.70,
+      "market_prob": 0.70,
+      "resolved_yes": true,
+      "correct": true
+    }
+  ],
+  "exact_match": null
+}

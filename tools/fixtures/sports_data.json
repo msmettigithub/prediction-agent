@@ -1,0 +1,28 @@
+{
+  "events": [
+    {
+      "sport": "basketball",
+      "league": "nba",
+      "home_team": {"name": "Boston Celtics", "record": "52-20", "recent_form": ["W", "W", "L", "W", "W"]},
+      "away_team": {"name": "Denver Nuggets", "record": "48-24", "recent_form": ["W", "L", "W", "W", "L"]},
+      "start_time": "2026-04-05T19:30:00Z",
+      "venue": "TD Garden",
+      "injury_report": [
+        {"player": "Kristaps Porzingis", "team": "Boston Celtics", "status": "Questionable", "injury": "Knee soreness"}
+      ]
+    }
+  ],
+  "odds": {
+    "game_id": "nba-20260405-bos-den",
+    "moneyline": {"home": -165, "away": 140},
+    "spread": {"home": -3.5, "away": 3.5},
+    "total": {"over": 218.5, "under": 218.5},
+    "implied_win_prob": {"home": 0.622, "away": 0.378},
+    "source": "consensus",
+    "last_updated": "2026-04-02T12:00:00Z"
+  },
+  "team_stats": {
+    "Boston Celtics": {"ppg": 118.2, "opp_ppg": 108.5, "net_rating": 9.7, "pace": 100.3},
+    "Denver Nuggets": {"ppg": 115.8, "opp_ppg": 110.2, "net_rating": 5.6, "pace": 98.7}
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "expert_tweets": [
+    {
+      "author": "FedWatcherPro",
+      "author_followers": 125000,
+      "is_expert": true,
+      "bio_keywords": ["economist", "fed", "monetary policy"],
+      "text": "Latest CPI data suggests the Fed has room to cut, but they'll want to see at least 2 more months of improvement before acting. June cut is a coin flip at best.",
+      "created_at": "2026-03-30T14:22:00Z",
+      "likes": 4500,
+      "retweets": 1200,
+      "sentiment_score": -0.15
+    },
+    {
+      "author": "MacroAnalyst",
+      "author_followers": 89000,
+      "is_expert": true,
+      "bio_keywords": ["macro", "rates", "bonds"],
+      "text": "The labor market is finally cooling. This is exactly the data the Fed needs to justify a June cut. Positioning for rate-sensitive assets.",
+      "created_at": "2026-03-29T09:15:00Z",
+      "likes": 3200,
+      "retweets": 890,
+      "sentiment_score": 0.65
+    }
+  ],
+  "general_tweets": [
+    {
+      "author": "randomuser123",
+      "is_expert": false,
+      "text": "Fed is definitely cutting in June, trust me bro",
+      "sentiment_score": 0.80
+    },
+    {
+      "author": "bearish_trader",
+      "is_expert": false,
+      "text": "No way they cut with inflation still above target",
+      "sentiment_score": -0.70
+    }
+  ],
+  "summary": {
+    "expert_sentiment_score": 0.25,
+    "expert_tweet_count": 2,
+    "general_sentiment_score": 0.05,
+    "general_tweet_count": 2,
+    "weighted_sentiment": 0.217,
+    "sample_size": 4
+  }
+}

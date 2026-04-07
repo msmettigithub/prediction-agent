@@ -1,0 +1,24 @@
+{
+  "filings": [
+    {
+      "filing_type": "8-K",
+      "company": "Tesla Inc",
+      "cik": "0001318605",
+      "date_filed": "2026-03-28",
+      "description": "Entry into a Material Definitive Agreement",
+      "url": "https://www.sec.gov/Archives/edgar/data/1318605/000131860526000042/tsla-20260328.htm",
+      "key_excerpt": "On March 27, 2026, Tesla, Inc. entered into a definitive agreement to acquire SolarBank Corp for approximately $2.1 billion in an all-stock transaction..."
+    },
+    {
+      "filing_type": "SC 13D",
+      "company": "Acme Corp",
+      "cik": "0001234567",
+      "date_filed": "2026-03-25",
+      "description": "Activist stake disclosure",
+      "url": "https://www.sec.gov/Archives/edgar/data/1234567/000123456726000015/sc13d.htm",
+      "key_excerpt": "Starboard Value LP has acquired a 7.2% stake in Acme Corp and intends to engage with the board regarding strategic alternatives including a potential sale..."
+    }
+  ],
+  "query": "Tesla acquisition 2026",
+  "total_results": 2
+}

@@ -1,0 +1,14 @@
+{
+  "our_probability": 0.62,
+  "market_probability": 0.50,
+  "edge": 0.12,
+  "raw_kelly": 0.24,
+  "quarter_kelly": 0.06,
+  "capped_kelly": 0.05,
+  "bet_amount": 50.0,
+  "bankroll": 1000,
+  "existing_exposure": 150.0,
+  "adjusted_bet": 42.5,
+  "break_even_probability": 0.50,
+  "expected_value_per_dollar": 0.24
+}

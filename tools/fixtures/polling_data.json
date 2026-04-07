@@ -1,0 +1,33 @@
+{
+  "polls": [
+    {
+      "race": "2026 US Senate Generic Ballot",
+      "candidates": [
+        {"name": "Democratic", "poll_average": 46.2, "trend_7d": -0.3},
+        {"name": "Republican", "poll_average": 44.8, "trend_7d": 0.5}
+      ],
+      "lead_margin": 1.4,
+      "sample_size_weighted": 12500,
+      "last_updated": "2026-03-30",
+      "source": "RealClearPolitics"
+    },
+    {
+      "race": "Presidential Approval Rating",
+      "candidates": [
+        {"name": "Approve", "poll_average": 42.1, "trend_7d": -0.8},
+        {"name": "Disapprove", "poll_average": 53.4, "trend_7d": 0.6}
+      ],
+      "lead_margin": -11.3,
+      "sample_size_weighted": 25000,
+      "last_updated": "2026-03-31",
+      "source": "RealClearPolitics"
+    }
+  ],
+  "historical_reference": {
+    "query": "Supreme Court justice retirement",
+    "wiki_results": [
+      {"year": 2022, "event": "Stephen Breyer retirement", "context": "Announced Jan 2022, effective June 2022"},
+      {"year": 2018, "event": "Anthony Kennedy retirement", "context": "Announced June 2018, effective July 2018"}
+    ]
+  }
+}

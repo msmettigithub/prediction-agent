@@ -1,0 +1,22 @@
+{
+  "fred_series": {
+    "FEDFUNDS": {"value": 5.33, "date": "2026-03-01", "prev_value": 5.33, "unit": "percent"},
+    "CPIAUCSL": {"value": 313.5, "date": "2026-02-01", "prev_value": 312.1, "unit": "index"},
+    "UNRATE": {"value": 4.1, "date": "2026-02-01", "prev_value": 4.0, "unit": "percent"},
+    "GDP": {"value": 28900.5, "date": "2025-10-01", "prev_value": 28500.2, "unit": "billions"},
+    "T10YIE": {"value": 2.35, "date": "2026-03-28", "prev_value": 2.30, "unit": "percent"},
+    "DFF": {"value": 5.33, "date": "2026-03-31", "prev_value": 5.33, "unit": "percent"},
+    "SOFR": {"value": 5.31, "date": "2026-03-31", "prev_value": 5.31, "unit": "percent"},
+    "PCE": {"value": 2.5, "date": "2026-02-01", "prev_value": 2.6, "unit": "percent_yoy"}
+  },
+  "fedwatch": {
+    "next_meeting": "2026-05-06",
+    "probabilities": {
+      "hold": 0.45,
+      "cut_25bp": 0.38,
+      "cut_50bp": 0.12,
+      "hike_25bp": 0.05
+    },
+    "implied_rate_eoy": 4.85
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "results": [
+    {
+      "title": "Federal Reserve Officials Signal Patience on Rate Cuts Amid Persistent Inflation",
+      "snippet": "Fed Governor Waller said the central bank needs more evidence that inflation is cooling before cutting rates. Markets now price in fewer cuts for 2026.",
+      "url": "https://example.com/fed-rates-2026",
+      "published_date": "2026-03-28",
+      "relevance_score": 0.92,
+      "source": "Reuters"
+    },
+    {
+      "title": "Bitcoin Rallies Past $95K as Institutional Inflows Accelerate",
+      "snippet": "Bitcoin surged above $95,000 driven by record ETF inflows. Analysts remain divided on whether the $100K barrier will be broken this quarter.",
+      "url": "https://example.com/btc-95k",
+      "published_date": "2026-03-25",
+      "relevance_score": 0.85,
+      "source": "Bloomberg"
+    },
+    {
+      "title": "Supreme Court Term Preview: Major Cases and Retirement Speculation",
+      "snippet": "Legal analysts note that Justice Thomas, 77, and Justice Alito, 76, face renewed retirement speculation ahead of the 2026 term.",
+      "url": "https://example.com/scotus-2026",
+      "published_date": "2026-03-20",
+      "relevance_score": 0.78,
+      "source": "SCOTUSblog"
+    },
+    {
+      "title": "March Jobs Report Shows Cooling Labor Market",
+      "snippet": "The economy added 145,000 jobs in March, below expectations of 200,000. Unemployment ticked up to 4.1%.",
+      "url": "https://example.com/jobs-march-2026",
+      "published_date": "2026-03-15",
+      "relevance_score": 0.65,
+      "source": "WSJ"
+    },
+    {
+      "title": "Crypto Regulation Bill Advances in Senate Committee",
+      "snippet": "The bipartisan crypto market structure bill cleared the Senate Banking Committee, providing clearer regulatory framework for digital assets.",
+      "url": "https://example.com/crypto-regulation",
+      "published_date": "2026-03-10",
+      "relevance_score": 0.55,
+      "source": "The Block"
+    }
+  ],
+  "query": "Fed rate cut 2026",
+  "search_engine": "tavily"
+}

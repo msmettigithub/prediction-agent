@@ -1,0 +1,40 @@
+{
+  "results": [
+    {
+      "id": 12345,
+      "title": "Will the Fed cut rates by June 2026?",
+      "url": "https://www.metaculus.com/questions/12345/",
+      "community_prediction": {
+        "full": {"q2": 0.58},
+        "history": [
+          {"t": 1704067200, "x1": 0.55},
+          {"t": 1706745600, "x1": 0.57},
+          {"t": 1709251200, "x1": 0.58}
+        ]
+      },
+      "resolution_criteria": "Resolves YES if the Federal Reserve lowers the federal funds rate target by at least 25 basis points before July 1, 2026.",
+      "close_time": "2026-06-30T20:00:00Z",
+      "number_of_forecasters": 142,
+      "status": "open",
+      "categories": ["economics", "finance"]
+    },
+    {
+      "id": 12346,
+      "title": "Will Bitcoin price exceed $100,000 in 2026?",
+      "url": "https://www.metaculus.com/questions/12346/",
+      "community_prediction": {
+        "full": {"q2": 0.42},
+        "history": [
+          {"t": 1704067200, "x1": 0.38},
+          {"t": 1706745600, "x1": 0.40},
+          {"t": 1709251200, "x1": 0.42}
+        ]
+      },
+      "resolution_criteria": "Resolves YES if at any point during 2026 the price of Bitcoin exceeds $100,000 USD on any major exchange.",
+      "close_time": "2026-12-31T23:59:59Z",
+      "number_of_forecasters": 89,
+      "status": "open",
+      "categories": ["crypto", "finance"]
+    }
+  ]
+}

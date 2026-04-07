@@ -1,0 +1,28 @@
+[
+  {
+    "id": "abc123def",
+    "question": "Will the Fed cut rates by June 2026?",
+    "url": "https://manifold.markets/FedWatcher/will-the-fed-cut-rates-by-june-2026",
+    "probability": 0.55,
+    "volume": 15200,
+    "totalTraders": 234,
+    "closeTime": 1751295600000,
+    "isResolved": false,
+    "resolution": null,
+    "createdTime": 1704067200000,
+    "mechanism": "cpmm-1"
+  },
+  {
+    "id": "xyz789ghi",
+    "question": "Bitcoin above $100K by end of April 2026?",
+    "url": "https://manifold.markets/CryptoTrader/bitcoin-above-100k-by-end-of-april",
+    "probability": 0.41,
+    "volume": 8500,
+    "totalTraders": 156,
+    "closeTime": 1746057599000,
+    "isResolved": false,
+    "resolution": null,
+    "createdTime": 1706745600000,
+    "mechanism": "cpmm-1"
+  }
+]
