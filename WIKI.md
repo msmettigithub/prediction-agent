@@ -112,6 +112,7 @@ Dashboard Commands tab -> direct insert to agent_commands table
 This chat -> Claude creates Saturn job to inject into agent_commands DB
 
 ## Tool Experiments
+- 2026-04-07 09:08: textblob: SKIP — TextBlob provides basic rule-based sentiment polarity and subjectivity scores de
 - 2026-04-07 08:59: vaderSentiment: USEFUL — VADER sentiment analysis can provide supplementary signal for Kalshi prediction 
 - 2026-04-07 08:50: statsmodels: USEFUL — Statsmodels is moderately useful for Kalshi prediction market trading. Logistic 
 - 2026-04-07 08:40: newsapi: USEFUL — NewsAPI provides real-time headlines that can serve as leading indicators for Ka
