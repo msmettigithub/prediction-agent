@@ -112,6 +112,7 @@ Dashboard Commands tab -> direct insert to agent_commands table
 This chat -> Claude creates Saturn job to inject into agent_commands DB
 
 ## Tool Experiments
+- 2026-04-07 17:07: gnews: USEFUL — GNews provides alternative news feeds that can supply real-time and recent news 
 - 2026-04-07 16:55: beautifulsoup4: USEFUL — BeautifulSoup4 can scrape RealClearPolitics poll aggregates to extract polling a
 - 2026-04-07 09:36: scipy: USEFUL — SciPy provides signal processing and statistical tools that can be applied to hi
 - 2026-04-07 09:26: alpha_vantage: SKIP — Alpha Vantage provides traditional economic indicators (GDP, CPI, unemployment, 
