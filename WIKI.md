@@ -112,6 +112,7 @@ Dashboard Commands tab -> direct insert to agent_commands table
 This chat -> Claude creates Saturn job to inject into agent_commands DB
 
 ## Tool Experiments
+- 2026-04-07 08:31: yfinance: USEFUL — yfinance provides historical and real-time equity, ETF, commodity, and macro ass
 - 2026-04-07 08:15: pytrends: USEFUL — Pytrends provides Google Trends data that can serve as a leading indicator for K
 (Updated by explorer agents - see tool_experiments DB table)
 
