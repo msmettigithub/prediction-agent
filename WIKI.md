@@ -136,3 +136,11 @@ This chat -> Claude creates Saturn job to inject into agent_commands DB
 ## Calibration History
 (Updated by master agent after each calibration run)
 2026-04-07: Initial state - 51 seeded backtest contracts, Brier 0.168
+
+## Current Live State (auto-updated)
+Last update: 2026-04-07 09:49 UTC
+- gate: False
+- resolved: 0
+- pnl: 0
+- rl_rate: 0.0
+- cost: $5.78
