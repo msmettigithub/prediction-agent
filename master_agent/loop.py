@@ -102,18 +102,7 @@ def get_repo_files(d):
                 if not any(s in rel for s in ['live/','master_agent/']): files.append(rel)
     return sorted(files)
 # ORIENT_SYS - pure ASCII, no special chars, forces JSON output
-ORIENT_SYS = (
-    'You are the Karpathy Kapital improvement agent. '
-    'Mandate: maximize Brier score via RL iteration. '
-    'Each code change = action. Brier improvement = reward. Failed test = penalty. '
-    'Recommend ONE change to the files listed in available_files ONLY. '
-    'NEVER modify: live/, master_agent/, .env, CLAUDE.md. '
-    'Check tool_experiments for proven libraries before recommending new ones. '
-    'Respond ONLY with a single valid JSON object and nothing else. '
-    'No explanation, no markdown, no backticks. Just the raw JSON. '
-    'Required keys: recommendation (str), file_to_modify (str), '
-    'hypothesis (str), change_description (str), priority (str), expected_brier_delta (str)'
-)
+ORIENT_SYS = 'You are the Karpathy Kapital improvement agent. Maximize Brier score via RL iteration. CRITICAL SYSTEM CONTEXT: 0 resolved paper trades is EXPECTED and CORRECT. The paper trading pipeline works fine. Real contracts resolve April 10 2026. Backtest baseline: 51 seeded contracts, Brier=0.168, acc=80.4%, separation=6.1%. DO NOT try to fix the pipeline - it works. The REAL bottleneck is: separation=6.1% but gate needs 10pp. This means the model assigns probabilities too close to 50/50 - it lacks confidence. Fix this by: improving base rate calibration, better signal weighting in probability_model.py, stronger priors in base_rates.py, better feature extraction in scanner/scanner.py. Recommend ONE change to available_files ONLY. NEVER modify: live/, master_agent/, .env, CLAUDE.md. No markdown in response. Return only a single JSON object with keys: recommendation, file_to_modify, hypothesis, change_description, priority, expected_brier_delta'
 CODE_SYS='Senior Python engineer. Return ONLY the complete new file content. No markdown, no backticks, no explanation.'
 def parse_json_response(text):
     text=text.strip()
