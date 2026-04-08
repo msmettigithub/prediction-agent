@@ -23,7 +23,7 @@ SELF_ID='18efeea066bc4d828b984ec1d752d131'
 client=anthropic.Anthropic()
 _lock=threading.Lock()
 _git_lock=threading.Lock()
-DAILY_BUDGET=50.0
+DAILY_BUDGET=float(os.environ.get("DAILY_BUDGET","999999"))
 _cost=[0.0]; _day=[datetime.now(timezone.utc).date().isoformat()]
 def track(i,o,m):
     t=datetime.now(timezone.utc).date().isoformat()
@@ -241,6 +241,10 @@ def main():
     if wiki: wiki.log_decision('v6: ASCII fix + JSON retry logic','UTF-8 encoding bug caused all orient calls to fail')
     last_change=0; cycle=0; last_wiki=0
     while True:
+    while os.environ.get("AGENT_PAUSED","false").lower()=="true":
+        print("[LOOP] Paused.")
+        import time as _t;_t.sleep(30)
+
         cycle+=1; cid=str(uuid.uuid4())[:8]
         try:
             obs=observe(DB); gate=check_confidence(DB); rl=rl_stats(); speed=cycle_speed(rl)
