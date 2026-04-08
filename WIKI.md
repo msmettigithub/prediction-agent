@@ -127,6 +127,7 @@ This chat -> Claude creates Saturn job to inject into agent_commands DB
 (Updated by explorer agents - see tool_experiments DB table)
 
 ## Decision Log
+- 2026-04-08 21:01: v6: ASCII fix + JSON retry logic | rationale: UTF-8 encoding bug caused all orient calls to fail
 - 2026-04-07 17:00: v6: ASCII fix + JSON retry logic | rationale: UTF-8 encoding bug caused all orient calls to fail
 - 2026-04-07 16:56: v6: ASCII fix + JSON retry logic | rationale: UTF-8 encoding bug caused all orient calls to fail
 - 2026-04-07 08:25: v6: ASCII fix + JSON retry logic | rationale: UTF-8 encoding bug caused all orient calls to fail
