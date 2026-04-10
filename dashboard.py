@@ -883,7 +883,7 @@ function loadLive(){{
       if(d.alerts&&d.alerts.length){{
         html+=`<div style="padding:8px 10px;color:#ffaa00;font-size:11px;font-weight:700;border-bottom:1px solid #1a1a2e">EDGES DETECTED</div>`;
         html+=d.alerts.map(a=>{{
-          return `<div style="padding:4px 10px;border-bottom:1px solid #0f0f1a;font-size:12px"><span style="color:#ffaa00;font-weight:600">${{a.side}}</span> <span style="color:#ddd">${{a.ticker}}</span> <span style="color:#00ff88">edge=${{(a.edge*100).toFixed(1)}}pp</span> <span style="color:#888">fair=${{(a.fair*100).toFixed(0)}}c mkt=${{(a.market*100).toFixed(0)}}c spot=$${Number(a.spot).toLocaleString()}</span></div>`;
+          return `<div style="padding:4px 10px;border-bottom:1px solid #0f0f1a;font-size:12px"><span style="color:#ffaa00;font-weight:600">${{a.side}}</span> <span style="color:#ddd">${{a.ticker}}</span> <span style="color:#00ff88">edge=${{(a.edge*100).toFixed(1)}}pp</span> <span style="color:#888">fair=${{(a.fair*100).toFixed(0)}}c mkt=${{(a.market*100).toFixed(0)}}c spot=$${{Number(a.spot).toLocaleString()}}</span></div>`;
         }}).join('');
       }}
       // Top positions

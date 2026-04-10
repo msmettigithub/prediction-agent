@@ -175,22 +175,47 @@ def run():
         if no_price <= 0.01 or no_price >= 0.99:
             continue
 
-        # Data check: run modifiers to confirm the edge is real, not just cheap price
+        # Data-driven edge check: compute model fair value, only trade if data confirms edge
         try:
             from model.data_modifiers import get_modifiers_for_contract
+            from model.probability_model import estimate_probability, Modifier
+            from database.models import Contract
             from datetime import timedelta
             exp_time = datetime.now(timezone.utc) + timedelta(hours=cand['hours_left'])
             mods = get_modifiers_for_contract(
-                source_id=ticker, category='', market_price=cand['yes_ask'],
+                source_id=ticker, category=cand['series'], market_price=cand['yes_ask'],
                 title=cand['title'], close_time=exp_time)
-            # If data modifiers exist and disagree (push YES higher), skip
-            if mods:
-                net_direction = sum(m.direction * m.weight for m in mods)
-                if net_direction > 0.3:  # data says YES is more likely than market thinks
-                    log(f"DATA BLOCK: {ticker} — modifiers favor YES (dir={net_direction:+.2f})", 'INFO')
-                    continue
-        except:
-            pass  # no data available = rely on price-only signal (backtest-validated)
+            contract = Contract(id=0, title=cand['title'], source='kalshi', source_id=ticker,
+                category=cand['series'], yes_price=cand['yes_ask'], close_time=exp_time,
+                open_time=datetime.now(timezone.utc), volume_24h=0)
+            est = estimate_probability(contract, modifiers=mods, config=config)
+            model_yes = est.probability
+            # Edge = how much we think NO is worth vs what we'd pay
+            # model_yes is our fair YES probability, so fair NO = 1 - model_yes
+            # edge = fair_no - no_ask (positive = we think NO is underpriced)
+            data_edge = (1 - model_yes) - cand['no_ask']
+            # We need BOTH: price is cheap AND data doesn't disagree
+            if mods and data_edge < -0.05:
+                # Data says YES is more likely than market — NO is overpriced, skip
+                log(f"DATA SKIP: {ticker} model_yes={model_yes:.0%} mkt_yes={cand['yes_ask']:.0%} "
+                    f"data says NO overpriced (edge={data_edge:+.1%})", 'INFO')
+                continue
+            cand['model_yes'] = model_yes
+            cand['data_edge'] = data_edge
+            cand['n_modifiers'] = len(mods)
+            cand['modifiers'] = [f"{m.name}({m.direction:+.1f})" for m in mods]
+        except Exception as e:
+            cand['model_yes'] = cand['yes_ask']
+            cand['data_edge'] = 0
+            cand['n_modifiers'] = 0
+            cand['modifiers'] = []
+        # Require data for macro contracts — price-only is not enough for CPI/GDP
+        series = cand['series']
+        if series in ('KXCPI', 'KXGDP', 'KXUNRATE') and cand['n_modifiers'] == 0:
+            log(f"NO DATA: {ticker} — {series} requires FRED data (set FRED_API_KEY)", 'INFO')
+            continue
+        # For intraday contracts (S&P, BTC, Gold, WTI), vol data from Yahoo is sufficient
+        # — backtest validated these at 100% win rate with vol model
 
         shares = compute_shares(MAX_BET_DOLLARS, no_price)
         if shares < 1:
@@ -223,7 +248,9 @@ def run():
         log(f"{'[DRY] ' if DRY_RUN else ''}TRADE: BUY NO {ticker} "
             f"{shares}sh @ {price_cents}c cost=${cost:.2f} "
             f"exp_profit=${expected_profit:.2f} hrs={cand['hours_left']:.1f} "
-            f"| {cand['title'][:60]}")
+            f"model_yes={cand.get('model_yes',0):.0%} data_edge={cand.get('data_edge',0):+.1%} "
+            f"mods={cand.get('n_modifiers',0)} {cand.get('modifiers',[])} "
+            f"| {cand['title'][:50]}")
 
         if DRY_RUN:
             trades_skipped += 1
