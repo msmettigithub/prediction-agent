@@ -394,40 +394,33 @@ def main():
                 except: pass
 
             # ── ACT ──
-            # Execute entries
-            for e in entries:
-                price_cents = max(1, min(99, int(round(e['price'] * 100))))
-                try:
-                    order = place_order(trader, e['ticker'], e['side'], e['shares'], price_cents)
-                    oid = order.get('order',{}).get('order_id','')[:12] if isinstance(order.get('order'), dict) else ''
-                    log(f"ENTER: BUY NO {e['ticker']} {e['shares']}sh @{price_cents}c "
-                        f"edge={e['edge']:+.0%} fair_yes={e['fair_yes']:.0%} spot=${e['spot']:,.0f} "
-                        f"hrs={e['hours']:.1f} | {oid}", 'MILESTONE')
-                    total_entered += 1
-                    existing_tickers.add(e['ticker'])
-                except Exception as ex:
-                    log(f"ENTRY FAILED: {e['ticker']} — {str(ex)[:80]}", 'ERROR')
+            # Execute entries — only when we've validated the strategy works
+            # Currently: monitor-only mode. Log opportunities but don't trade.
+            # Enable by setting BRAIN_TRADE_ENABLED=true in environment.
+            brain_enabled = os.environ.get('BRAIN_TRADE_ENABLED', 'false').lower() == 'true'
+            if entries and brain_enabled:
+                for e in entries:
+                    price_cents = max(1, min(99, int(round(e['price'] * 100))))
+                    try:
+                        order = place_order(trader, e['ticker'], e['side'], e['shares'], price_cents)
+                        oid = order.get('order',{}).get('order_id','')[:12] if isinstance(order.get('order'), dict) else ''
+                        log(f"ENTER: BUY NO {e['ticker']} {e['shares']}sh @{price_cents}c "
+                            f"edge={e['edge']:+.0%} fair_yes={e['fair_yes']:.0%} spot=${e['spot']:,.0f} "
+                            f"hrs={e['hours']:.1f} | {oid}", 'MILESTONE')
+                        total_entered += 1
+                        existing_tickers.add(e['ticker'])
+                    except Exception as ex:
+                        log(f"ENTRY FAILED: {e['ticker']} — {str(ex)[:80]}", 'ERROR')
+            elif entries:
+                log(f"{len(entries)} entry signals (monitor-only, set BRAIN_TRADE_ENABLED=true to trade)", 'INFO')
 
-            # Execute exits — sell positions where edge is gone or we can take profit
-            for x in exits[:2]:  # max 2 exits per cycle
-                price_cents = max(1, min(99, int(round(x['price'] * 100))))
-                try:
-                    url = f'{trader.TRADING_URL}/portfolio/orders'
-                    payload = {'ticker': x['ticker'], 'side': x['side'], 'action': 'sell',
-                               'type': 'limit', 'count': x['shares']}
-                    if x['side'] == 'yes':
-                        payload['yes_price'] = price_cents
-                    else:
-                        payload['no_price'] = price_cents
-                    resp = _kalshi.post(url, headers=trader._signed_headers('POST', url),
-                                      json=payload, timeout=15)
-                    resp.raise_for_status()
-                    oid = resp.json().get('order',{}).get('order_id','')[:12] if isinstance(resp.json().get('order'), dict) else ''
-                    log(f"EXIT: SELL {x['side'].upper()} {x['ticker']} {x['shares']}sh @{price_cents}c "
-                        f"{x['reason']} | {oid}", 'MILESTONE')
-                    total_exited += 1
-                except Exception as ex:
-                    log(f"EXIT FAILED: {x['ticker']} — {str(ex)[:80]}", 'ERROR')
+            # Exit logic DISABLED — previous version sold winning positions.
+            # TODO: rebuild exit logic that only sells when:
+            #   1. Position is profitable AND edge has flipped (take profit)
+            #   2. Position loss exceeds stop-loss threshold (cut loss)
+            # For now, hold all positions to settlement.
+            if exits:
+                log(f"{len(exits)} exit signals (not executing — hold to settlement)", 'INFO')
 
             # ── WRITE STATE ──
             net = total_pnl  # simplified — full MTM is in the old monitor
