@@ -209,13 +209,11 @@ def run():
             cand['data_edge'] = 0
             cand['n_modifiers'] = 0
             cand['modifiers'] = []
-        # Require data for macro contracts — price-only is not enough for CPI/GDP
+        # Require data for macro contracts — need BLS/FRED data
         series = cand['series']
         if series in ('KXCPI', 'KXGDP', 'KXUNRATE') and cand['n_modifiers'] == 0:
-            log(f"NO DATA: {ticker} — {series} requires FRED data (set FRED_API_KEY)", 'INFO')
+            log(f"NO DATA: {ticker} — {series} has no modifiers, skipping", 'INFO')
             continue
-        # For intraday contracts (S&P, BTC, Gold, WTI), vol data from Yahoo is sufficient
-        # — backtest validated these at 100% win rate with vol model
 
         shares = compute_shares(MAX_BET_DOLLARS, no_price)
         if shares < 1:

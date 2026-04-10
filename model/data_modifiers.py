@@ -143,90 +143,87 @@ def _parse_inx_strike(source_id: str) -> tuple[Optional[float], bool]:
 
 # ── CPI (KXCPI) ─────────────────────────────────────────────────────────────
 
+def _fetch_bls_cpi() -> dict:
+    """Fetch CPI data directly from BLS (no API key needed)."""
+    try:
+        import requests
+        r = requests.get('https://api.bls.gov/publicAPI/v2/timeseries/data/CUUR0000SA0',
+            json={'startyear': '2025', 'endyear': '2026'}, timeout=10)
+        if r.status_code != 200:
+            return {}
+        data = r.json().get('Results', {}).get('series', [{}])[0].get('data', [])
+        # Filter out missing values
+        valid = [d for d in data if d.get('value') and d['value'] != '-']
+        if len(valid) < 3:
+            return {}
+        values = [float(d['value']) for d in valid[:6]]
+        latest_mom = (values[0] - values[1]) / values[1] * 100
+        prev_mom = (values[1] - values[2]) / values[2] * 100
+        trend = 'rising' if latest_mom > prev_mom else 'falling' if latest_mom < prev_mom else 'flat'
+        return {'latest_mom': latest_mom, 'prev_mom': prev_mom, 'trend': trend,
+                'latest_value': values[0], 'period': valid[0].get('year', '') + '-' + valid[0].get('period', '')}
+    except:
+        return {}
+
+
 def _cpi_modifiers(
     source_id: str, market_price: float, title: str,
 ) -> list[Modifier]:
-    """Generate modifiers for CPI contracts using FRED data + consensus."""
+    """Generate modifiers for CPI contracts using BLS data + consensus."""
     mods = []
     try:
-        from tools.fed_data import FedDataTool
         from tools.econ_calendar import get_next_release
 
-        # Get current CPI trend from FRED
-        tool = FedDataTool(mock_mode=False)
-        result = tool.run(series=["CPIAUCSL"], include_fedwatch=False)
-        if result.get("success") and result.get("data", {}).get("series", {}).get("CPIAUCSL"):
-            cpi_data = result["data"]["series"]["CPIAUCSL"]
-            trend = cpi_data.get("trend_direction", "unknown")
+        # Get current CPI trend from BLS (no API key needed)
+        cpi_bls = _fetch_bls_cpi()
+        if cpi_bls:
+            trend = cpi_bls['trend']
+            latest_mom = cpi_bls['latest_mom']
 
-            # Parse threshold from source_id: KXCPI-26APR-T0.8 → 0.8%
             threshold = _parse_threshold(source_id)
             if threshold is None:
                 return mods
 
-            # CPI trend signal
-            # Historical MoM: mean ~0.25%, std ~0.20%
-            # If trend is rising, higher thresholds more likely
+            # Use actual CPI MoM data to estimate probability
+            # Latest MoM = 0.47%, previous = 0.37%
+            # If threshold < latest_mom, YES is likely. If threshold > latest_mom, NO is likely.
             if trend == "rising":
-                # Rising CPI → higher probability of exceeding threshold
-                # But effect depends on how far threshold is from mean
-                if threshold <= 0.3:
-                    # Threshold near/below mean — rising trend makes this very likely
-                    mods.append(Modifier(
-                        name="cpi_trend_rising",
-                        direction=0.4,
-                        weight=0.5,
-                        source=f"fred:CPIAUCSL trend=rising thresh={threshold}%",
-                    ))
-                elif threshold <= 0.6:
-                    # Moderate threshold — rising helps
-                    mods.append(Modifier(
-                        name="cpi_trend_rising",
-                        direction=0.3,
-                        weight=0.4,
-                        source=f"fred:CPIAUCSL trend=rising thresh={threshold}%",
-                    ))
+                if threshold <= latest_mom * 0.8:
+                    mods.append(Modifier(name="cpi_trend_rising", direction=0.5, weight=0.6,
+                        source=f"bls:CPI mom={latest_mom:.2f}% trend=rising thresh={threshold}%"))
+                elif threshold <= latest_mom * 1.2:
+                    mods.append(Modifier(name="cpi_trend_rising", direction=0.2, weight=0.4,
+                        source=f"bls:CPI mom={latest_mom:.2f}% trend=rising thresh={threshold}%"))
                 else:
-                    # High threshold (>0.6%) — even rising trend doesn't help much
-                    mods.append(Modifier(
-                        name="cpi_trend_rising",
-                        direction=0.1,
-                        weight=0.2,
-                        source=f"fred:CPIAUCSL trend=rising thresh={threshold}%",
-                    ))
+                    mods.append(Modifier(name="cpi_above_trend", direction=-0.3, weight=0.4,
+                        source=f"bls:CPI mom={latest_mom:.2f}% thresh={threshold}% above recent"))
             elif trend == "falling":
-                if threshold >= 0.4:
-                    mods.append(Modifier(
-                        name="cpi_trend_falling",
-                        direction=-0.4,
-                        weight=0.5,
-                        source=f"fred:CPIAUCSL trend=falling thresh={threshold}%",
-                    ))
+                if threshold >= latest_mom:
+                    mods.append(Modifier(name="cpi_trend_falling", direction=-0.4, weight=0.5,
+                        source=f"bls:CPI mom={latest_mom:.2f}% trend=falling thresh={threshold}%"))
                 else:
-                    mods.append(Modifier(
-                        name="cpi_trend_falling",
-                        direction=-0.2,
-                        weight=0.3,
-                        source=f"fred:CPIAUCSL trend=falling thresh={threshold}%",
-                    ))
+                    mods.append(Modifier(name="cpi_trend_falling", direction=-0.1, weight=0.3,
+                        source=f"bls:CPI mom={latest_mom:.2f}% trend=falling thresh={threshold}%"))
+            else:
+                # Flat — compare threshold to recent MoM
+                gap = latest_mom - threshold
+                if abs(gap) > 0.1:
+                    direction = 0.3 if gap > 0 else -0.3
+                    mods.append(Modifier(name="cpi_vs_recent", direction=direction, weight=0.3,
+                        source=f"bls:CPI mom={latest_mom:.2f}% vs thresh={threshold}%"))
 
-        # Check consensus estimate from econ calendar
-        next_rel = get_next_release()
-        if next_rel and "CPI" in (next_rel.get("name", "") or ""):
-            consensus = next_rel.get("consensus_estimate")
-            if consensus is not None and threshold is not None:
-                # Consensus is the % change estimate
-                # If threshold < consensus, market should price YES high
-                # If threshold > consensus, market should price YES low
-                gap = consensus - threshold
-                if abs(gap) > 0.05:  # meaningful gap
-                    direction = 0.5 if gap > 0 else -0.5
-                    mods.append(Modifier(
-                        name="cpi_consensus",
-                        direction=direction,
-                        weight=min(0.6, abs(gap) * 2),
-                        source=f"econ_cal:CPI consensus={consensus}% thresh={threshold}%",
-                    ))
+        # Use recent CPI MoM as the best consensus proxy
+        # (the econ_calendar consensus field has the index level, not the change)
+        if latest_mom > 0:
+            gap = latest_mom - threshold
+            if abs(gap) > 0.05:
+                direction = 0.4 if gap > 0 else -0.4
+                mods.append(Modifier(
+                    name="cpi_recent_vs_threshold",
+                    direction=direction,
+                    weight=min(0.5, abs(gap) * 2),
+                    source=f"bls:recent_mom={latest_mom:.2f}% vs thresh={threshold}%",
+                ))
 
     except Exception as e:
         logger.debug(f"CPI modifier failed: {e}")
@@ -236,57 +233,59 @@ def _cpi_modifiers(
 
 # ── GDP (KXGDP) ─────────────────────────────────────────────────────────────
 
+def _fetch_bls_productivity() -> dict:
+    """Fetch productivity/GDP data from BLS (no API key needed)."""
+    try:
+        import requests
+        r = requests.get('https://api.bls.gov/publicAPI/v2/timeseries/data/PRS85006092',
+            json={'startyear': '2025', 'endyear': '2026'}, timeout=10)
+        if r.status_code != 200:
+            return {}
+        data = r.json().get('Results', {}).get('series', [{}])[0].get('data', [])
+        valid = [d for d in data if d.get('value') and d['value'] != '-']
+        if not valid:
+            return {}
+        latest = float(valid[0]['value'])
+        prev = float(valid[1]['value']) if len(valid) > 1 else latest
+        trend = 'rising' if latest > prev else 'falling' if latest < prev else 'flat'
+        return {'latest': latest, 'prev': prev, 'trend': trend,
+                'period': valid[0].get('year', '') + '-' + valid[0].get('period', '')}
+    except:
+        return {}
+
+
 def _gdp_modifiers(
     source_id: str, market_price: float, title: str,
 ) -> list[Modifier]:
-    """Generate modifiers for GDP contracts using FRED data + consensus."""
+    """Generate modifiers for GDP contracts using BLS productivity data."""
     mods = []
     try:
-        from tools.fed_data import FedDataTool
-        from tools.econ_calendar import get_next_release
-
         threshold = _parse_threshold(source_id)
         if threshold is None:
             return mods
 
-        # Get GDP trend from FRED
-        tool = FedDataTool(mock_mode=False)
-        result = tool.run(series=["GDP"], include_fedwatch=False)
-        if result.get("success") and result.get("data", {}).get("series", {}).get("GDP"):
-            gdp_data = result["data"]["series"]["GDP"]
-            trend = gdp_data.get("trend_direction", "unknown")
+        # Get productivity trend from BLS (proxy for GDP growth)
+        prod = _fetch_bls_productivity()
+        if prod:
+            latest = prod['latest']
+            trend = prod['trend']
 
-            if trend == "rising":
-                direction = 0.3 if threshold <= 2.5 else 0.1
-                mods.append(Modifier(
-                    name="gdp_trend",
-                    direction=direction,
-                    weight=0.3,
-                    source=f"fred:GDP trend={trend} thresh={threshold}%",
-                ))
-            elif trend == "falling":
-                direction = -0.3 if threshold >= 2.0 else -0.1
-                mods.append(Modifier(
-                    name="gdp_trend",
-                    direction=direction,
-                    weight=0.3,
-                    source=f"fred:GDP trend={trend} thresh={threshold}%",
-                ))
-
-        # Check consensus
-        next_rel = get_next_release()
-        if next_rel and "GDP" in (next_rel.get("name", "") or ""):
-            consensus = next_rel.get("consensus_estimate")
-            if consensus is not None:
-                gap = consensus - threshold
-                if abs(gap) > 0.2:
-                    direction = 0.5 if gap > 0 else -0.5
-                    mods.append(Modifier(
-                        name="gdp_consensus",
-                        direction=direction,
-                        weight=min(0.6, abs(gap) / 2),
-                        source=f"econ_cal:GDP consensus={consensus}% thresh={threshold}%",
-                    ))
+            # Productivity data: latest Q4 2025 = 1.8%, prior Q3 = 5.2%
+            # Falling productivity suggests weaker GDP
+            if trend == 'falling':
+                if threshold >= latest:
+                    mods.append(Modifier(name="gdp_productivity_falling", direction=-0.4, weight=0.5,
+                        source=f"bls:productivity={latest}% falling, thresh={threshold}%"))
+                else:
+                    mods.append(Modifier(name="gdp_productivity_falling", direction=-0.1, weight=0.3,
+                        source=f"bls:productivity={latest}% falling, thresh={threshold}%"))
+            elif trend == 'rising':
+                if threshold <= latest:
+                    mods.append(Modifier(name="gdp_productivity_rising", direction=0.3, weight=0.4,
+                        source=f"bls:productivity={latest}% rising, thresh={threshold}%"))
+                else:
+                    mods.append(Modifier(name="gdp_productivity_rising", direction=0.1, weight=0.2,
+                        source=f"bls:productivity={latest}% rising, thresh={threshold}%"))
 
     except Exception as e:
         logger.debug(f"GDP modifier failed: {e}")
