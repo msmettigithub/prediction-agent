@@ -78,13 +78,30 @@ def check_db_writable():
 
 
 def check_dashboard():
-    """Check if local dashboard responds."""
+    """Check if dashboard responds AND is serving fresh data."""
     try:
-        import urllib.request
+        import urllib.request, json
         r = urllib.request.urlopen('http://localhost:8000/api/status', timeout=5)
-        return r.status == 200, 'dashboard OK'
+        if r.status != 200:
+            return False, f'dashboard HTTP {r.status}'
+        # Also check it's actually our process (not a zombie holding the port)
+        r2 = urllib.request.urlopen('http://localhost:8000/api/monitor', timeout=5)
+        data = json.loads(r2.read())
+        cycle = data.get('cycle', 0)
+        if cycle == 0:
+            return False, 'dashboard serving but brain not connected (cycle=0)'
+        return True, f'dashboard OK, brain cycle={cycle}'
     except Exception as e:
-        return False, f'dashboard down: {e}'
+        # Dashboard is DOWN — try to restart it
+        try:
+            import subprocess
+            subprocess.Popen(['python', '-u', 'dashboard.py'],
+                cwd='/home/jovyan/workspace/prediction-agent',
+                stdout=open('/tmp/dashboard.log', 'a'),
+                stderr=subprocess.STDOUT)
+            return False, f'dashboard was down, attempted restart: {e}'
+        except:
+            return False, f'dashboard down, restart failed: {e}'
 
 
 def check_stale_trades():
@@ -133,11 +150,43 @@ def check_live_safety():
 
 def run_audit():
     """Run all checks, log results, create priority commands for failures."""
+    def check_brain():
+        """Check if trading brain is running and fresh."""
+        try:
+            import json
+            with open('/tmp/live_monitor.json') as f:
+                d = json.load(f)
+            ts = d.get('ts', '')
+            cycle = d.get('cycle', 0)
+            if not ts:
+                return False, 'brain state file empty'
+            from datetime import datetime, timezone
+            state_time = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+            age = (datetime.now(timezone.utc) - state_time).total_seconds()
+            if age > 30:
+                # Brain is stale — try to restart
+                try:
+                    import subprocess, os
+                    env = os.environ.copy()
+                    env['BRAIN_TRADE_ENABLED'] = env.get('BRAIN_TRADE_ENABLED', 'false')
+                    subprocess.Popen(['python', '-u', 'workers/trading_brain.py'],
+                        cwd='/home/jovyan/workspace/prediction-agent', env=env,
+                        stdout=open('/tmp/trading_brain.log', 'a'),
+                        stderr=subprocess.STDOUT)
+                except: pass
+                return False, f'brain stale ({age:.0f}s old, cycle={cycle}), attempted restart'
+            return True, f'brain OK, cycle={cycle}, {age:.0f}s fresh'
+        except FileNotFoundError:
+            return False, 'brain state file not found — brain not running'
+        except Exception as e:
+            return False, f'brain check failed: {e}'
+
     checks = [
         ('imports', check_imports),
         ('tests', check_tests),
         ('db_writable', check_db_writable),
         ('dashboard', check_dashboard),
+        ('brain', check_brain),
         ('stale_trades', check_stale_trades),
         ('error_rate', check_error_rate),
         ('live_safety', check_live_safety),
