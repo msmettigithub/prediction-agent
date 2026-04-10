@@ -157,6 +157,89 @@ What should we do?"""
     return _call_claude(system, prompt, max_tokens=300)
 
 
+def generate_trade_ideas(
+    balance: float, total_exposure: float, realized_pnl: float,
+    positions: list, intel: dict, available_markets: list,
+    recent_settlements: list = None,
+) -> list[dict]:
+    """Ask LLM to propose NEW trade ideas based on the full picture.
+
+    Returns list of: {ticker, side, reason, conviction, size_suggestion}
+    These get fed back into the top of the stack: edge check → P&L forecast → review → execute.
+    """
+    system = """You are a quantitative trader for a Kalshi prediction market fund.
+Given the portfolio, market intel, and available contracts, propose 1-3 specific trades.
+
+For each trade, respond with ONLY a JSON array:
+[{"ticker": "EXACT_TICKER", "side": "yes" or "no", "reason": "1 sentence why",
+  "conviction": 0.0-1.0, "size_pct": 0.01-0.05}]
+
+Rules:
+- Only propose trades on tickers from the AVAILABLE MARKETS list
+- Consider correlation with existing positions (don't double up on same risk)
+- Prefer high risk/reward (cheap contracts with asymmetric payoff)
+- Factor in market intel direction and conviction
+- Consider time to expiry — shorter = more certain, longer = more uncertain
+- Real money. Be specific. No generic advice."""
+
+    pos_text = '\n'.join(
+        f"  {p.get('side','?')} {p.get('ticker','?')} {p.get('shares',0)}sh "
+        f"entry={p.get('entry',0):.2f} ev=${p.get('ev',0):+.2f}"
+        for p in (positions or [])[:10]
+    )
+
+    intel_text = '\n'.join(
+        f"  {name}: {v.get('dir',0):+.2f} ({'bull' if v.get('dir',0)>0.2 else 'bear' if v.get('dir',0)<-0.2 else 'flat'}) "
+        f"conv={v.get('conv',0):.0%} vol={v.get('vol','?')}"
+        for name, v in (intel or {}).items()
+    )
+
+    mkt_text = '\n'.join(
+        f"  {m.get('ticker','')} yes={m.get('yes_ask',0):.0%} no={m.get('no_ask',0):.0%} "
+        f"hours={m.get('hours',0):.0f} strike={m.get('strike',0)}"
+        for m in (available_markets or [])[:30]
+    )
+
+    settlements_text = ''
+    if recent_settlements:
+        settlements_text = '\nRECENT SETTLEMENTS (learn from these):\n' + '\n'.join(
+            f"  {s}" for s in recent_settlements[:10])
+
+    prompt = f"""PORTFOLIO: balance=${balance:,.0f} exposure=${total_exposure:,.0f} realized_pnl=${realized_pnl:+,.0f}
+
+CURRENT POSITIONS:
+{pos_text}
+
+MARKET INTEL:
+{intel_text}
+
+AVAILABLE MARKETS (can trade these):
+{mkt_text}
+{settlements_text}
+
+Propose 1-3 trades. JSON array only."""
+
+    text = _call_claude(system, prompt, max_tokens=400)
+    if not text:
+        return []
+
+    try:
+        import re
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if match:
+            ideas = json.loads(match.group())
+            # Validate
+            valid = []
+            valid_tickers = {m.get('ticker', '') for m in (available_markets or [])}
+            for idea in ideas:
+                if idea.get('ticker') in valid_tickers and idea.get('side') in ('yes', 'no'):
+                    valid.append(idea)
+            return valid
+        return []
+    except:
+        return []
+
+
 def review_code_health() -> str:
     """Ask LLM to review recent errors and suggest fixes."""
     import sqlite3

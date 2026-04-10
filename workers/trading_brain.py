@@ -384,6 +384,8 @@ def main():
     last_db_log = 0
     last_portfolio_review = 0
     last_code_review = 0
+    last_idea_generation = 0
+    llm_ideas = []  # ideas from LLM, fed into entry pipeline
     balance = 0
     cached_markets = {}
     existing_tickers = set()
@@ -630,6 +632,7 @@ def main():
                     'unrealized': h.unrealized_pnl, 'realizable': h.realizable_pnl,
                     'pnl_pct': h.pnl_pct, 'win_prob': h.win_probability, 'ev': h.expected_pnl,
                 } for h in sorted(hold_reports, key=lambda h: h.realizable_pnl)[:20]],
+                'llm_ideas': llm_ideas,
                 'exit_candidates': [{'reason': r, 'ticker': ef.ticker, 'pnl': ef.realized_pnl,
                                      'profitable': ef.is_profitable} for r, ef, _ in exit_candidates],
                 'positions': [{
@@ -656,6 +659,39 @@ def main():
                   f"{elapsed:.0f}ms C#{cycle} {spot_line} bal=${balance:.0f} "
                   f"exp=${total_exp:.0f} pnl=${total_pnl:+.0f} "
                   f"pos={len(positions)}{action_line}")
+
+            # LLM idea generation every 5 min — proposes new trades
+            if time.time() - last_idea_generation > 300 and cached_markets:
+                try:
+                    from model.llm_reviewer import generate_trade_ideas
+                    hr = [{'side':h.side,'ticker':h.ticker,'shares':h.shares,'entry':h.entry_price,
+                           'fair':h.current_fair,'ev':h.expected_pnl} for h in hold_reports]
+                    intel_dict = {name: {'dir': v.direction, 'conv': v.conviction, 'vol': v.vol_regime}
+                                 for name, v in intel.items()} if intel else {}
+                    # Build available markets list for the LLM
+                    avail = []
+                    for ticker, m in cached_markets.items():
+                        ya = float(m.get('yes_ask_dollars','0') or 0)
+                        na = float(m.get('no_ask_dollars','0') or 0)
+                        if ya <= 0.01 and na <= 0.01: continue
+                        strike, is_threshold = parse_strike(ticker)
+                        exp_str = m.get('expiration_time') or m.get('close_time') or ''
+                        hours = 16.0
+                        if exp_str:
+                            try:
+                                exp_dt = datetime.fromisoformat(exp_str.replace('Z','+00:00'))
+                                hours = max(0.1, (exp_dt - datetime.now(timezone.utc)).total_seconds() / 3600)
+                            except: pass
+                        avail.append({'ticker':ticker,'yes_ask':ya,'no_ask':na,'hours':hours,'strike':strike or 0})
+
+                    llm_ideas = generate_trade_ideas(
+                        balance=balance, total_exposure=total_exp, realized_pnl=total_pnl,
+                        positions=hr, intel=intel_dict, available_markets=avail)
+                    if llm_ideas:
+                        log(f"LLM IDEAS: {json.dumps(llm_ideas, default=str)[:300]}", 'MILESTONE')
+                    last_idea_generation = time.time()
+                except Exception as e:
+                    log(f"Idea generation error: {e}", 'ERROR')
 
             # LLM portfolio review every 15 min
             if time.time() - last_portfolio_review > 900:
