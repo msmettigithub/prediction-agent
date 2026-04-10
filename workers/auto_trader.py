@@ -175,6 +175,23 @@ def run():
         if no_price <= 0.01 or no_price >= 0.99:
             continue
 
+        # Data check: run modifiers to confirm the edge is real, not just cheap price
+        try:
+            from model.data_modifiers import get_modifiers_for_contract
+            from datetime import timedelta
+            exp_time = datetime.now(timezone.utc) + timedelta(hours=cand['hours_left'])
+            mods = get_modifiers_for_contract(
+                source_id=ticker, category='', market_price=cand['yes_ask'],
+                title=cand['title'], close_time=exp_time)
+            # If data modifiers exist and disagree (push YES higher), skip
+            if mods:
+                net_direction = sum(m.direction * m.weight for m in mods)
+                if net_direction > 0.3:  # data says YES is more likely than market thinks
+                    log(f"DATA BLOCK: {ticker} — modifiers favor YES (dir={net_direction:+.2f})", 'INFO')
+                    continue
+        except:
+            pass  # no data available = rely on price-only signal (backtest-validated)
+
         shares = compute_shares(MAX_BET_DOLLARS, no_price)
         if shares < 1:
             continue
