@@ -139,10 +139,38 @@ def orient(obs,gate,rl,aid,avail):
         except Exception as e:
             log(DB,f'[{aid}] orient attempt {attempt+1} error: {e}','ERROR')
     return None
-def decide(rec):
+ADVISOR_SYS='You are a quantitative trading strategist advising an autonomous prediction market trading agent. Your only goal is to improve separation score from 6.1% to 10%. Be specific and technical.'
+def advise(obs,gate,rl,cid):
+    """ADVISE step: call claude-sonnet for strategic recommendation on improving separation."""
+    if not ok_budget(): return ''
+    state=gate.get('metrics',{})
+    changes=dbq('SELECT ts,hyp,file,ok,deployed FROM agent_changes ORDER BY ts DESC LIMIT 5')
+    user_msg=json.dumps({
+        'brier_score':state.get('brier'),
+        'separation_score':state.get('sep',0.061),
+        'accuracy':state.get('acc'),
+        'win_rate':state.get('wr'),
+        'resolved_trades':obs.get('trades',{}).get('resolved',0),
+        'pnl':obs.get('trades',{}).get('pnl',0),
+        'rl_deploy_rate':rl.get('rate',0),
+        'last_5_agent_changes':changes,
+    },default=str)
+    try:
+        r=client.messages.create(model='claude-sonnet-4-6',max_tokens=1000,
+            system=ADVISOR_SYS,messages=[{'role':'user','content':user_msg}])
+        track(r.usage.input_tokens,r.usage.output_tokens,'sonnet')
+        rec=r.content[0].text.strip()
+        dbw("INSERT INTO agent_log(ts,cid,lvl,agent,msg) VALUES(?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(),cid,'INFO','advisor',rec[:2000]))
+        return rec
+    except Exception as e:
+        log(DB,f'[{cid}] advisor error:{e}','ERROR',cid=cid)
+        return ''
+def decide(rec,advisor_rec=''):
     if not ok_budget(): return None
+    advisor_ctx=f"\n\n## Advisor Recommendation\n{advisor_rec}" if advisor_rec else ''
     r=client.messages.create(model='claude-sonnet-4-6',max_tokens=4000,system=CODE_SYS,
-        messages=[{'role':'user','content':f"Implement this change.\nFile: {rec['file_to_modify']}\nChange: {rec['change_description']}\nHypothesis: {rec['hypothesis']}"}])
+        messages=[{'role':'user','content':f"Implement this change.\nFile: {rec['file_to_modify']}\nChange: {rec['change_description']}\nHypothesis: {rec['hypothesis']}{advisor_ctx}"}])
     track(r.usage.input_tokens,r.usage.output_tokens,'sonnet')
     return r.content[0].text.strip()
 def act(rec,new,cid):
@@ -223,12 +251,13 @@ def sub_agent(aid,obs,gate,rl,q):
         all_known=set(KNOWN_FILES+avail)
         if rec.get('file_to_modify') not in all_known: log(DB,f'[{cid}] SKIP phantom file:{rec.get("file_to_modify")}','WARN',cid=cid); return
         log(DB,f'[{cid}] {aid} rec:{rec["recommendation"]} -> {rec["file_to_modify"]}',cid=cid)
+        advisor_rec=advise(obs,gate,rl,cid)
         d2=tempfile.mkdtemp()
         try:
             subprocess.run(['git','clone','--depth=1',REPO,d2],capture_output=True,timeout=60)
             fp=os.path.join(d2,rec['file_to_modify']); cur=open(fp).read() if os.path.exists(fp) else ''
         finally: shutil.rmtree(d2,ignore_errors=True)
-        new=decide(rec)
+        new=decide(rec,advisor_rec)
         if new: q.put((rec,new,cid,rec.get('priority','medium')))
     except Exception as e: log(DB,f'[{cid}] sub_agent error:{e}','ERROR',cid=cid)
 def main():
