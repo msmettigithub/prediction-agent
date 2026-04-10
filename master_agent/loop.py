@@ -66,7 +66,7 @@ def saturn_api(method,path,body=None):
         return getattr(requests,method)(f'{BASE}{path}',json=body,headers=h,timeout=15).json()
     except: return {}
 IMG='9879fc989f054272903cd4afd5e520bd'
-SECRETS={'GITHUB_PAT':'3b8f8e0ea8a54b3fa85e210e3e94d79b','ANTHROPIC_API_KEY':'46a084f1474f4b3e8db0fbe5fbeb2f1d','SATURN_API_TOKEN':'e0e6ce81230d456d97077984c2135f09','KALSHI_API_KEY':'6efa392feb144083aa8eec4cee65ad2c','FRED_API_KEY':'25a493cef4e540b592259eaf410014d4','KALSHI_PRIVATE_KEY':'a2c72eae85324f7a91534b5ddae808a8','BANKROLL':'9a9ea2608f514ef5a9d665e5227f53b3','EDGE_THRESHOLD':'d6f9deb20e294380ae60816b37b0a49c','LIVE_TRADING_ENABLED':'f7ddf60450d94f35a03c42559ca23629','MAX_LIVE_BANKROLL':'706c4f79d15f49728748aa145c1f2a0b','MAX_SINGLE_BET':'c66a5d68b7094b00b0818d56fe1a54e7','MOCK_TOOLS':'b43c2c1429ac41859ff507acfd104330'}
+SECRETS={'GITHUB_PAT':'3b8f8e0ea8a54b3fa85e210e3e94d79b','ANTHROPIC_API_KEY':'46a084f1474f4b3e8db0fbe5fbeb2f1d','SATURN_API_TOKEN':'e0e6ce81230d456d97077984c2135f09','KALSHI_API_KEY':'6efa392feb144083aa8eec4cee65ad2c','FRED_API_KEY':'25a493cef4e540b592259eaf410014d4','KALSHI_PRIVATE_KEY':'a2c72eae85324f7a91534b5ddae808a8','BANKROLL':'9a9ea2608f514ef5a9d665e5227f53b3','EDGE_THRESHOLD':'d6f9deb20e294380ae60816b37b0a49c','LIVE_TRADING_ENABLED':'f7ddf60450d94f35a03c42559ca23629','MAX_LIVE_BANKROLL':'706c4f79d15f49728748aa145c1f2a0b','MAX_SINGLE_BET':'c66a5d68b7094b00b0818d56fe1a54e7','MOCK_TOOLS':'b43c2c1429ac41859ff507acfd104330','OPENROUTER':'OPENROUTER_SECRET_ID'}
 SHARED='ab695f5218d6402cb9289b821764c370'; GIT='9929090f1a4a48f6904f947210b94708'
 def attach_all(rtype,rid):
     for name,sid in SECRETS.items():
@@ -140,8 +140,24 @@ def orient(obs,gate,rl,aid,avail):
             log(DB,f'[{aid}] orient attempt {attempt+1} error: {e}','ERROR')
     return None
 ADVISOR_SYS='You are a quantitative trading strategist advising an autonomous prediction market trading agent. Your only goal is to improve separation score from 6.1% to 10%. Be specific and technical.'
+OPENROUTER_KEY=os.environ.get('OPENROUTER','')
+ADVISOR_MODELS=[
+    ('anthropic/claude-sonnet-4','claude-sonnet'),
+    ('google/gemini-2.5-flash','gemini-flash'),
+    ('openai/gpt-4.1-mini','gpt-4.1-mini'),
+]
+def _openrouter_call(model,system,user_msg,max_tokens=1000):
+    """Call a model via OpenRouter API. Returns response text or empty string."""
+    r=requests.post('https://openrouter.ai/api/v1/chat/completions',
+        headers={'Authorization':f'Bearer {OPENROUTER_KEY}','Content-Type':'application/json'},
+        json={'model':model,'max_tokens':max_tokens,
+              'messages':[{'role':'system','content':system},{'role':'user','content':user_msg}]},
+        timeout=30)
+    if r.status_code!=200: return ''
+    choices=r.json().get('choices',[])
+    return choices[0]['message']['content'].strip() if choices else ''
 def advise(obs,gate,rl,cid):
-    """ADVISE step: call claude-sonnet for strategic recommendation on improving separation."""
+    """ADVISE step: fan out to multiple LLMs via OpenRouter for diverse strategic recommendations."""
     if not ok_budget(): return ''
     state=gate.get('metrics',{})
     changes=dbq('SELECT ts,hyp,file,ok,deployed FROM agent_changes ORDER BY ts DESC LIMIT 5')
@@ -155,17 +171,31 @@ def advise(obs,gate,rl,cid):
         'rl_deploy_rate':rl.get('rate',0),
         'last_5_agent_changes':changes,
     },default=str)
-    try:
-        r=client.messages.create(model='claude-sonnet-4-6',max_tokens=1000,
-            system=ADVISOR_SYS,messages=[{'role':'user','content':user_msg}])
-        track(r.usage.input_tokens,r.usage.output_tokens,'sonnet')
-        rec=r.content[0].text.strip()
-        dbw("INSERT INTO agent_log(ts,cid,lvl,agent,msg) VALUES(?,?,?,?,?)",
-            (datetime.now(timezone.utc).isoformat(),cid,'INFO','advisor',rec[:2000]))
-        return rec
-    except Exception as e:
-        log(DB,f'[{cid}] advisor error:{e}','ERROR',cid=cid)
-        return ''
+    recs=[]
+    # Fan out to multiple models via OpenRouter
+    if OPENROUTER_KEY:
+        for model_id,label in ADVISOR_MODELS:
+            try:
+                r=_openrouter_call(model_id,ADVISOR_SYS,user_msg)
+                if r:
+                    recs.append(f'[{label}] {r}')
+                    dbw("INSERT INTO agent_log(ts,cid,lvl,agent,msg) VALUES(?,?,?,?,?)",
+                        (datetime.now(timezone.utc).isoformat(),cid,'INFO',f'advisor-{label}',r[:2000]))
+            except Exception as e:
+                log(DB,f'[{cid}] advisor-{label} error:{e}','WARN',cid=cid)
+    # Fallback to direct Anthropic if OpenRouter unavailable or as additional signal
+    if not recs:
+        try:
+            r=client.messages.create(model='claude-sonnet-4-6',max_tokens=1000,
+                system=ADVISOR_SYS,messages=[{'role':'user','content':user_msg}])
+            track(r.usage.input_tokens,r.usage.output_tokens,'sonnet')
+            rec=r.content[0].text.strip()
+            recs.append(f'[claude-sonnet-direct] {rec}')
+            dbw("INSERT INTO agent_log(ts,cid,lvl,agent,msg) VALUES(?,?,?,?,?)",
+                (datetime.now(timezone.utc).isoformat(),cid,'INFO','advisor',rec[:2000]))
+        except Exception as e:
+            log(DB,f'[{cid}] advisor error:{e}','ERROR',cid=cid)
+    return '\n\n'.join(recs)
 def decide(rec,advisor_rec=''):
     if not ok_budget(): return None
     advisor_ctx=f"\n\n## Advisor Recommendation\n{advisor_rec}" if advisor_rec else ''
