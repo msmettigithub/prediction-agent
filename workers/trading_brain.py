@@ -173,18 +173,19 @@ def compute_fair(spot, strike, vol, hours, is_threshold, series):
 
 
 def find_entries(markets, spots, existing_tickers, balance):
-    """Find new positions to enter. Returns list of trade dicts."""
+    """Find ALL mispriced contracts — both YES and NO side.
+    Returns entries (actionable trades) and opportunities (all edges for logging)."""
     entries = []
+    opportunities = []
+
     for ticker, m in markets.items():
-        if ticker in existing_tickers: continue
         series = get_series(ticker)
         if not series or series not in spots: continue
-        if series in MACRO_SERIES: continue  # need FRED data
+        if series in MACRO_SERIES: continue
 
         yes_ask = float(m.get('yes_ask_dollars', '0') or 0)
         no_ask = float(m.get('no_ask_dollars', '0') or 0)
-        if yes_ask < 0.03 or yes_ask > MAX_YES_PRICE: continue
-        if no_ask <= 0.01: continue
+        if yes_ask <= 0.01 and no_ask <= 0.01: continue
 
         strike, is_threshold = parse_strike(ticker)
         if strike is None: continue
@@ -197,29 +198,41 @@ def find_entries(markets, spots, existing_tickers, balance):
                 exp = datetime.fromisoformat(exp_str.replace('Z', '+00:00'))
                 hours = max(0.1, (exp - datetime.now(timezone.utc)).total_seconds() / 3600)
             except: pass
-        if hours < 0.5: continue  # too close to expiry
+        if hours < 0.5: continue
 
         fair_yes = compute_fair(spot.price, strike, spot.realized_vol, hours, is_threshold, series)
-        fair_no = 1 - fair_yes
-        edge = fair_no - no_ask  # positive = NO is underpriced = good for us
 
-        if edge < MIN_EDGE: continue
+        # Check BOTH sides for edge
+        edge_buy_yes = fair_yes - yes_ask if yes_ask > 0.01 else 0
+        edge_buy_no = (1 - fair_yes) - no_ask if no_ask > 0.01 else 0
 
-        fee = kalshi_fee(yes_ask)
-        expected_profit = (yes_ask - fee)
-        shares = compute_shares(MAX_BET, no_ask)
-        if shares < 1: continue
-        cost = shares * no_ask
-        if cost > balance * 0.05: continue  # max 5% of balance
+        best_side = 'yes' if edge_buy_yes > edge_buy_no else 'no'
+        best_edge = max(edge_buy_yes, edge_buy_no)
+        best_price = yes_ask if best_side == 'yes' else no_ask
 
-        entries.append({
-            'ticker': ticker, 'side': 'no', 'shares': shares, 'price': no_ask,
-            'cost': cost, 'edge': edge, 'fair_yes': fair_yes, 'yes_ask': yes_ask,
-            'expected_profit': expected_profit * shares,
-            'spot': spot.price, 'strike': strike, 'hours': hours, 'series': series,
-        })
+        if best_edge > 0.03:  # log anything with >3pp edge
+            opp = {
+                'ticker': ticker, 'side': best_side, 'edge': round(best_edge, 4),
+                'fair_yes': round(fair_yes, 4), 'yes_ask': yes_ask, 'no_ask': no_ask,
+                'spot': spot.price, 'strike': strike, 'hours': round(hours, 1),
+                'series': series, 'held': ticker in existing_tickers,
+            }
+            opportunities.append(opp)
 
-    return sorted(entries, key=lambda x: -x['edge'])[:MAX_TRADES_PER_CYCLE]
+            # Only actionable if edge > threshold, not already held, affordable
+            if best_edge >= MIN_EDGE and ticker not in existing_tickers and best_price > 0.01:
+                shares = compute_shares(MAX_BET, best_price)
+                if shares >= 1:
+                    cost = shares * best_price
+                    if cost <= balance * 0.05:
+                        entries.append({
+                            **opp, 'shares': shares, 'price': best_price,
+                            'cost': cost, 'expected_profit': round(best_edge * shares, 2),
+                        })
+
+    opportunities.sort(key=lambda x: -x['edge'])
+    entries.sort(key=lambda x: -x['edge'])
+    return entries[:MAX_TRADES_PER_CYCLE], opportunities
 
 
 def find_exits(positions, spots, markets):
@@ -309,13 +322,17 @@ def place_order(trader, ticker, side, shares, price_cents):
 def build_event_tickers():
     now = datetime.now(timezone.utc)
     tickers = []
-    for offset in range(2):
+    for offset in range(5):  # today + 4 days ahead
         d = now + timedelta(days=offset)
         ds = d.strftime('%y%b%d').upper()
         tickers.extend([
             f'KXINX-{ds}H1600', f'KXBTCD-{ds}17',
             f'KXGOLDW-{ds}17', f'KXWTI-{ds}',
         ])
+    # Monthly macro (even without FRED, log them as opportunities)
+    for mo in ['26APR', '26MAY', '26JUN']:
+        tickers.append(f'KXCPI-{mo}')
+    tickers.extend(['KXGDP-26APR30', 'KXGDP-26JUL30'])
     return tickers
 
 
@@ -376,10 +393,11 @@ def main():
                     by_series[s]['exp'] += float(p.get('market_exposure_dollars','0') or 0)
                     by_series[s]['n'] += 1
 
-            # Find entries
+            # Find entries + all opportunities
             entries = []
-            if config.live_trading_enabled and balance > MIN_BALANCE:
-                entries = find_entries(cached_markets, spots, existing_tickers, balance)
+            opportunities = []
+            if balance > 0:
+                entries, opportunities = find_entries(cached_markets, spots, existing_tickers, balance)
 
             # Find exits
             exits = find_exits(positions, spots, cached_markets)
@@ -437,13 +455,16 @@ def main():
                     'by_series': {s: dict(d) for s, d in by_series.items()},
                 },
                 'entries_available': len(entries),
+                'opportunities': len(opportunities),
                 'exit_signals': len(exits),
                 'total_entered': total_entered,
                 'total_exited': total_exited,
-                'alerts': [{'ticker': e['ticker'], 'side': 'NO', 'edge': e['edge'],
-                           'fair': 1-e['fair_yes'], 'market': e['price'],
-                           'spot': e['spot'], 'strike': e['strike'], 'series': e['series']}
-                          for e in entries],
+                'alerts': [{'ticker': o['ticker'], 'side': o['side'].upper(), 'edge': o['edge'],
+                           'fair': o['fair_yes'] if o['side']=='yes' else 1-o['fair_yes'],
+                           'market': o['yes_ask'] if o['side']=='yes' else o['no_ask'],
+                           'spot': o['spot'], 'strike': o['strike'], 'series': o['series'],
+                           'hours': o['hours'], 'held': o.get('held', False)}
+                          for o in opportunities[:15]],
                 'positions': [{
                     'ticker': p.get('ticker',''),
                     'series': get_series(p.get('ticker','')) or '',
@@ -460,6 +481,7 @@ def main():
             elapsed = (time.time() - t0) * 1000
             spot_line = ' '.join(f'{s}={spots[s].price:,.0f}' for s in sorted(spots))
             action_line = ''
+            if opportunities: action_line += f' edges={len(opportunities)}'
             if entries: action_line += f' +{len(entries)}trades'
             if exits: action_line += f' !{len(exits)}exits'
             if cancelled: action_line += f' x{cancelled}stale'
