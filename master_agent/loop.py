@@ -159,22 +159,48 @@ def _openrouter_call(model,system,user_msg,max_tokens=1000):
     choices=r.json().get('choices',[])
     return choices[0]['message']['content'].strip() if choices else ''
 def _openrouter_healthcheck():
-    """Verify OpenRouter connectivity at startup. Logs result."""
+    """Verify OpenRouter connectivity at startup. Logs result and writes status to git."""
+    status_lines=[f'# OpenRouter Status\n**Checked:** {datetime.now(timezone.utc).isoformat()}\n']
     if not OPENROUTER_KEY:
         log(DB,'OPENROUTER: key NOT found — will fallback to direct Anthropic','WARN')
+        status_lines.append('**Status:** KEY NOT FOUND\n')
+        _write_status(status_lines)
         return False
     try:
         r=requests.get('https://openrouter.ai/api/v1/models',
             headers={'Authorization':f'Bearer {OPENROUTER_KEY}'},timeout=10)
         if r.status_code==200:
             models=r.json().get('data',[])
-            log(DB,f'OPENROUTER: CONNECTED — {len(models)} models available, key=...{OPENROUTER_KEY[-6:]}','MILESTONE')
+            our_models=[m['id'] for m in models if any(x in m['id'] for x in ['claude-sonnet','gemini-2.5-flash','gpt-4.1-mini'])]
+            msg=f'OPENROUTER: CONNECTED — {len(models)} models available, key=...{OPENROUTER_KEY[-6:]}'
+            log(DB,msg,'MILESTONE')
+            status_lines.append(f'**Status:** CONNECTED\n**Models available:** {len(models)}\n**Advisor models found:** {our_models}\n')
+            _write_status(status_lines)
             return True
         log(DB,f'OPENROUTER: auth failed status={r.status_code}','ERROR')
+        status_lines.append(f'**Status:** AUTH FAILED (HTTP {r.status_code})\n**Response:** {r.text[:200]}\n')
+        _write_status(status_lines)
         return False
     except Exception as e:
         log(DB,f'OPENROUTER: connection error: {e}','ERROR')
+        status_lines.append(f'**Status:** CONNECTION ERROR\n**Error:** {e}\n')
+        _write_status(status_lines)
         return False
+def _write_status(lines):
+    """Write OpenRouter status to repo and push so it's visible from any instance."""
+    try:
+        d=tempfile.mkdtemp()
+        if subprocess.run(['git','clone','--depth=1',REPO,d],capture_output=True,timeout=60).returncode!=0: return
+        subprocess.run(['git','config','user.email','kk@saturncloud.io'],cwd=d)
+        subprocess.run(['git','config','user.name','KK Agent'],cwd=d)
+        with open(os.path.join(d,'OPENROUTER_STATUS.md'),'w') as f: f.writelines(lines)
+        subprocess.run(['git','add','OPENROUTER_STATUS.md'],cwd=d)
+        subprocess.run(['git','commit','-m','diagnostic: OpenRouter status'],cwd=d,capture_output=True)
+        subprocess.run(['git','push'],cwd=d,capture_output=True,timeout=30)
+    except: pass
+    finally:
+        try: shutil.rmtree(d,ignore_errors=True)
+        except: pass
 def advise(obs,gate,rl,cid):
     """ADVISE step: fan out to multiple LLMs via OpenRouter for diverse strategic recommendations."""
     if not ok_budget(): return ''
