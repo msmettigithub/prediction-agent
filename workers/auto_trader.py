@@ -187,11 +187,18 @@ def run():
                 log(f"RISK BLOCK: {ticker} — {risk_reason}", 'WARN')
                 break  # stop all trading if risk limit hit
 
-        # Guard check
-        guard_result = guard.check_all(proposed_cost=cost)
-        if not guard_result.ok:
-            log(f"GUARD BLOCK: {ticker} — {guard_result.reason}", 'WARN')
+        # Balance check (use actual Kalshi balance, not static config cap)
+        try:
+            avail_balance = trader.get_balance()
+        except:
+            log(f"BALANCE CHECK FAILED, skipping", 'ERROR')
+            break
+        if cost > avail_balance * 0.05:  # max 5% of balance per trade
+            log(f"SIZE BLOCK: {ticker} cost=${cost:.2f} > 5% of ${avail_balance:.2f}", 'INFO')
             continue
+        if avail_balance < 50:  # stop trading if balance too low
+            log(f"LOW BALANCE: ${avail_balance:.2f}, stopping", 'WARN')
+            break
 
         price_cents = max(1, min(99, int(round(no_price * 100))))
         expected_profit = cand['yes_ask'] * shares - cand['fee'] * shares
