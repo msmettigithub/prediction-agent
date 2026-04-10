@@ -23,7 +23,7 @@ def get_repo_files():
 
 def observe(db):
     o={'ts':datetime.now(timezone.utc).isoformat(),
-       'calib':{'acc':0.804,'brier':0.168,'sep':0.061},
+       'calib':{'acc':0,'brier':1.0,'sep':0},
        'trades':{'open':0,'resolved':0,'pnl':0},
        'errors':[],
        'repo_files':[]}
@@ -32,11 +32,11 @@ def observe(db):
     if not os.path.exists(db): o['errors'].append('db missing'); return o
     try:
         c=sqlite3.connect(db); c.row_factory=sqlite3.Row; cur=c.cursor()
-        cur.execute("SELECT COUNT(*) n FROM paper_trades WHERE status='active'")
+        cur.execute("SELECT COUNT(*) n FROM paper_trades WHERE status='open'")
         o['trades']['open']=cur.fetchone()['n']
-        cur.execute("SELECT COUNT(*) n FROM paper_trades WHERE status='resolved'")
+        cur.execute("SELECT COUNT(*) n FROM paper_trades WHERE status IN ('won','lost')")
         o['trades']['resolved']=cur.fetchone()['n']
-        cur.execute("SELECT COALESCE(SUM(pnl),0) t FROM paper_trades WHERE status='resolved'")
+        cur.execute("SELECT COALESCE(SUM(pnl),0) t FROM paper_trades WHERE status IN ('won','lost')")
         o['trades']['pnl']=round(cur.fetchone()['t'],2)
         c.close()
     except Exception as e: o['errors'].append(str(e))

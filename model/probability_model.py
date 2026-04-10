@@ -1,9 +1,14 @@
 """Combines base rate + modifiers → calibrated probability with confidence interval.
 
 The model works in 3 steps:
-1. Start with the category base rate
-2. Apply modifier signals (each shifts the probability toward or away from YES)
-3. Clamp to [7%, 93%] floor/ceiling — even "certain" events fail ~5-7% of the time
+1. Start from market price (the strongest available prior)
+2. Apply modifier signals from real data (each shifts probability in log-odds space)
+3. Clamp to [7%, 93%] floor/ceiling
+
+CRITICAL: Without real data modifiers, the model should NOT deviate from market
+price. Phantom edges from blending a flat base rate into market price are fake.
+Only real signals (FRED data, BLS releases, implied vol, consensus estimates)
+should create edge.
 """
 
 from __future__ import annotations
@@ -43,12 +48,13 @@ def estimate_probability(
 ) -> ProbabilityEstimate:
     """Produce a calibrated probability estimate for a contract.
 
-    Uses log-odds space for combining signals to avoid probability compression
-    at extremes (0.9 + small signal should still move meaningfully).
+    Both backtest and live mode start from market price. The only thing
+    that should move the estimate away from market is real signal —
+    either from tool-derived modifiers (live) or static contract metadata
+    (backtest, but conservatively).
 
-    In backtest_mode: uses a weighted blend of base rate + market price with
-    static modifiers (close time, volume) to produce an independent signal.
-    In live mode: starts from market price and applies tool-derived modifiers.
+    Range-bucket contracts (S&P 25pt bands) get a much lower base rate
+    to prevent the old bug of inflating 5c contracts to 27c.
     """
     if config is None:
         from config import load_config
@@ -56,7 +62,8 @@ def estimate_probability(
     if modifiers is None:
         modifiers = []
 
-    base = get_base_rate(contract.category)
+    source_id = getattr(contract, 'source_id', '') or ''
+    base = get_base_rate(contract.category, source_id)
 
     market_prob = contract.yes_price
     if market_prob <= 0:
@@ -64,23 +71,19 @@ def estimate_probability(
     if market_prob >= 1:
         market_prob = 0.99
 
-    if backtest_mode:
-        # Backtest mode: blend base rate (independent) with market price (informative)
-        # Weight: 40% base rate, 60% market — gives the model genuine separation
-        # from pure market echo while still using market as a strong prior
-        blend = 0.40 * base.base_rate + 0.60 * market_prob
-        log_odds = math.log(blend / (1 - blend))
+    # Always start from market price — it's the strongest prior we have
+    log_odds = math.log(market_prob / (1 - market_prob))
 
-        # Apply static modifiers derivable from contract metadata
+    if backtest_mode:
+        # Apply conservative static modifiers from contract metadata.
+        # These should be SMALL adjustments, not a 40/60 blend with a
+        # generic base rate.
         static_mods = _derive_static_modifiers(contract, base)
         for mod in static_mods:
-            shift = mod.direction * mod.weight * 0.3
+            shift = mod.direction * mod.weight * 0.15  # reduced from 0.3
             log_odds += shift
-    else:
-        # Live mode: start from market price, apply tool-derived modifiers
-        log_odds = math.log(market_prob / (1 - market_prob))
 
-    # Apply explicit modifiers in log-odds space
+    # Apply explicit modifiers (from real data tools) in log-odds space
     for mod in modifiers:
         shift = mod.direction * mod.weight * 0.5  # 0.5 log-odds max per modifier
         log_odds += shift
@@ -88,7 +91,7 @@ def estimate_probability(
     # Convert back to probability
     raw_prob = 1.0 / (1.0 + math.exp(-log_odds))
 
-    # Clamp to floor/ceiling — enforced here, not in modifiers
+    # Clamp to floor/ceiling
     clamped_prob = max(config.model_prob_floor, min(config.model_prob_ceiling, raw_prob))
 
     # Confidence interval from base rate uncertainty + modifier disagreement
@@ -117,36 +120,16 @@ def estimate_probability(
 
 def _derive_static_modifiers(contract: Contract, base) -> list[Modifier]:
     """Derive modifiers from contract metadata only (no external data).
-    Used in backtest mode to give the model signal beyond base rate echo."""
+    These should be SMALL adjustments — not enough to generate tradeable edge
+    on their own."""
     mods = []
-    from datetime import datetime
 
-    # Time to close: closer contracts have more certainty
-    if contract.close_time and contract.open_time:
-        days_to_close = (contract.close_time - contract.open_time).days
-        if days_to_close <= 7:
-            # Very short horizon — market price is very informative, pull toward market
-            mods.append(Modifier(name="short_horizon", direction=0, weight=0.0, source="static"))
-        elif days_to_close <= 30:
-            # Medium horizon — slight regression toward base rate
-            mods.append(Modifier(name="medium_horizon", direction=-0.2, weight=0.3, source="static"))
-        else:
-            # Long horizon — more uncertainty, stronger regression to base rate
-            mods.append(Modifier(name="long_horizon", direction=-0.3, weight=0.4, source="static"))
-
-    # Volume signal: high volume = more informed market
+    # Volume signal: thin markets may have more mispricing
     if contract.volume_24h > 50000:
-        # Very liquid — trust market more (smaller base rate adjustment)
-        mods.append(Modifier(name="high_volume", direction=0.1, weight=0.2, source="static"))
+        mods.append(Modifier(name="high_volume", direction=0.0, weight=0.0, source="static"))
     elif contract.volume_24h < 1000:
-        # Thin market — more room for mispricing, lean toward base rate
-        mods.append(Modifier(name="low_volume", direction=-0.1, weight=0.3, source="static"))
-
-    # Price extremity: extreme prices are less reliable than mid-range
-    if contract.yes_price < 0.20 or contract.yes_price > 0.80:
-        # Extreme prices tend to overshoot — slight regression toward 50%
-        direction = 0.3 if contract.yes_price < 0.50 else -0.3
-        mods.append(Modifier(name="extreme_price_regression", direction=direction, weight=0.2, source="static"))
+        # Thin market — slightly wider CI but no directional signal
+        mods.append(Modifier(name="low_volume", direction=0.0, weight=0.0, source="static"))
 
     return mods
 

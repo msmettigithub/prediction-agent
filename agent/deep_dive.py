@@ -383,15 +383,26 @@ def _mock_deep_dive(
 ) -> DeepDiveResult:
     """Generate a mock deep-dive result when no API key is available or for testing."""
     from model.base_rates import get_base_rate
+    from model.data_modifiers import get_modifiers_for_contract
+    from model.probability_model import estimate_probability
     import math
 
-    base = get_base_rate(contract.category)
+    source_id = getattr(contract, 'source_id', '') or ''
+    base = get_base_rate(contract.category, source_id)
     market_prob = contract.yes_price
 
-    # Simple heuristic: blend market price with base rate
-    # Weight market price more heavily (it contains more info)
-    blended = 0.7 * market_prob + 0.3 * base.base_rate
-    blended = max(0.07, min(0.93, blended))
+    # Get real data modifiers instead of a fake base rate blend
+    data_mods = get_modifiers_for_contract(
+        source_id=source_id,
+        category=contract.category,
+        market_price=market_prob,
+        title=contract.title,
+        close_time=contract.close_time,
+    )
+
+    # Run through the proper probability model
+    estimate = estimate_probability(contract, modifiers=data_mods, config=config)
+    blended = estimate.probability
 
     edge = blended - market_prob
     abs_edge = abs(edge)
@@ -429,9 +440,16 @@ def _mock_deep_dive(
     factors = factors_map.get(contract.category, ["Base rate analysis", "Market price signal", "News sentiment"])[:5]
 
     modifiers = [
-        {"name": "base_rate_anchor", "direction": "neutral", "magnitude": "high", "evidence": f"Category base rate: {base.base_rate:.0%}"},
-        {"name": "market_signal", "direction": "toward_yes" if market_prob > 0.5 else "toward_no", "magnitude": "high", "evidence": f"Market prices contract at {market_prob:.0%}"},
+        {"name": m.name, "direction": "toward_yes" if m.direction > 0 else "toward_no" if m.direction < 0 else "neutral",
+         "magnitude": "high" if m.weight > 0.5 else "medium" if m.weight > 0.2 else "low",
+         "evidence": m.source}
+        for m in data_mods
     ]
+    if not modifiers:
+        modifiers = [{"name": "market_price", "direction": "neutral", "magnitude": "high",
+                       "evidence": f"No data modifiers — staying at market price {market_prob:.0%}"}]
+
+    data_sources = [m.source.split(":")[0] for m in data_mods]
 
     return DeepDiveResult(
         contract_id=str(contract.id or contract.source_id),
@@ -442,12 +460,12 @@ def _mock_deep_dive(
         kelly_fraction=kelly_data.get("capped_kelly", 0),
         recommended_action=action,
         key_factors=factors,
-        bull_case=f"Base rate and market signals support a {blended:.0%} probability. Key positive factors include recent momentum and historical patterns in {contract.category}.",
-        bear_case=f"Uncertainty remains high with limited data. Counter-arguments include model uncertainty (±{base.uncertainty:.0%}) and potential for unexpected developments.",
+        bull_case=f"Data-driven estimate: {blended:.0%}. {len(data_mods)} real data modifiers applied from {', '.join(data_sources) or 'none'}.",
+        bear_case=f"Uncertainty ±{base.uncertainty:.0%}. {len(data_mods)} data sources — {'sufficient' if len(data_mods) >= 2 else 'insufficient'} for high confidence.",
         base_rate_used=base.base_rate,
         modifiers_applied=modifiers,
         tools_used=unique_tools,
         tools_failed=list(set(tools_failed)),
-        reasoning_trace=f"Starting from {contract.category} base rate of {base.base_rate:.0%}. Market prices at {market_prob:.0%}. Blending 70/30 market/base gives {blended:.0%}. {'Insufficient tool data for high confidence.' if confidence == 'low' else 'Moderate tool coverage supports medium confidence.'}",
+        reasoning_trace=f"Market: {market_prob:.0%}. {len(data_mods)} data modifiers → model: {blended:.0%}. Edge: {edge:+.1%}. {'No real data — no edge.' if not data_mods else 'Data-backed edge.'}",
         generated_at=datetime.utcnow().isoformat(),
     )

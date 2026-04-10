@@ -8,7 +8,9 @@ import uvicorn,anthropic
 
 app=FastAPI()
 DB='/home/jovyan/shared/sm/prediction-agent-db/prediction_agent.db'
-client=anthropic.Anthropic()
+TRADE_DB=str(__import__('pathlib').Path(__file__).parent/'prediction_agent.db')
+_api_key=os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('ANTHROPIC') or ''
+client=anthropic.Anthropic(api_key=_api_key) if _api_key else None
 WIKI_URL='https://raw.githubusercontent.com/msmettigithub/prediction-agent/main/WIKI.md'
 
 def to_et(ts):
@@ -20,10 +22,11 @@ def to_et(ts):
         return et.strftime('%m/%d/%Y %H:%M:%S')
     except: return str(ts)[:19]
 
-def q(sql,p=()):
-    if not os.path.exists(DB): return []
+def q(sql,p=(),db=None):
+    d=db or DB
+    if not os.path.exists(d): return []
     try:
-        c=sqlite3.connect(DB); c.row_factory=sqlite3.Row
+        c=sqlite3.connect(d); c.row_factory=sqlite3.Row
         r=c.execute(sql,p).fetchall(); c.close(); return [dict(x) for x in r]
     except: return []
 
@@ -38,14 +41,19 @@ def w(sql,p=()):
 
 def get_data():
     logs=q('SELECT ts,lvl,agent,msg FROM agent_log ORDER BY ts DESC LIMIT 200')
-    open_=q("SELECT COUNT(*) n FROM paper_trades WHERE status='active'")
-    res=q("SELECT COUNT(*) n,COALESCE(SUM(pnl),0) pnl,AVG(CASE WHEN pnl>0 THEN 1.0 ELSE 0.0 END) wr FROM paper_trades WHERE status='resolved'")
+    open_=q("SELECT COUNT(*) n FROM paper_trades WHERE status='open'",db=TRADE_DB)
+    res=q("SELECT COUNT(*) n,COALESCE(SUM(pnl),0) pnl,AVG(CASE WHEN pnl>0 THEN 1.0 ELSE 0.0 END) wr FROM paper_trades WHERE status IN ('won','lost')",db=TRADE_DB)
+    positions=q("""SELECT pt.id,pt.side,pt.entry_price,pt.model_prob,pt.bet_amount,pt.status,pt.pnl,pt.opened_at,pt.closed_at,
+        c.title,c.source_id,c.yes_price,c.close_time FROM paper_trades pt JOIN contracts c ON pt.contract_id=c.id
+        ORDER BY CASE pt.status WHEN 'open' THEN 0 ELSE 1 END, pt.opened_at DESC""",db=TRADE_DB)
     changes=q('SELECT ts,hyp,file,ok,deployed FROM agent_changes ORDER BY ts DESC LIMIT 30')
     cmds=q("SELECT id,ts,command,status,result FROM agent_commands ORDER BY ts DESC LIMIT 30")
     tools=q('SELECT ts,tool_name,useful,notes FROM tool_experiments ORDER BY ts DESC LIMIT 20') if q("SELECT name FROM sqlite_master WHERE type='table' AND name='tool_experiments'") else []
+    wti=q("""SELECT id,ticker,strike,side,entry_price,shares,cost,model_prob,edge_at_entry,status,exit_price,pnl,opened_at,closed_at
+        FROM wti_paper_trades ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, opened_at DESC""",db=TRADE_DB) if q("SELECT name FROM sqlite_master WHERE type='table' AND name='wti_paper_trades'",db=TRADE_DB) else []
     return dict(logs=logs,open_trades=open_[0]['n'] if open_ else 0,
                 res=res[0] if res else {'n':0,'pnl':0,'wr':0},
-                changes=changes,cmds=cmds,tools=tools)
+                positions=positions,wti=wti,changes=changes,cmds=cmds,tools=tools)
 
 def get_context(d):
     logs=d['logs'][:15]; res=d['res']
@@ -66,10 +74,46 @@ async def post_command(req:Request):
 @app.post('/chat')
 async def chat(req:Request):
     try:
+        if not client: return JSONResponse({'error':'ANTHROPIC_API_KEY not set'},500)
         b=await req.json(); msg=b.get('message','').strip(); history=b.get('history',[])
         if not msg: return JSONResponse({'error':'empty'},400)
         d=get_data(); ctx=get_context(d)
-        sys_p=f'You are the AI interface for Karpathy Kapital, an autonomous prediction market fund.\nFull system context:\n{ctx}\nQueue commands with [COMMAND: text]. Be direct and data-driven.'
+        # Add live data feeds to context
+        import subprocess
+        try:
+            feed_line=subprocess.run(['tail','-1','/tmp/smart_trader.log'],capture_output=True,text=True,timeout=2).stdout.strip()
+        except: feed_line=''
+        # Add portfolio balance
+        try:
+            from config import load_config
+            from live.kalshi_trader import KalshiTrader
+            config=load_config()
+            trader=KalshiTrader(config)
+            balance=trader.get_balance()
+            bal_str=f'Balance: ${balance:,.2f}'
+        except: bal_str=''
+        live_ctx=f'\nLIVE FEEDS: {feed_line}\n{bal_str}'
+        # Get scan candidates for context
+        scan_ctx=''
+        cands=q("SELECT source_id,title,market_price,model_prob,edge,confidence,recommendation FROM scan_candidates WHERE ABS(edge)>0.05 ORDER BY ts DESC LIMIT 5",db=TRADE_DB)
+        if cands:
+            scan_ctx='\nSCAN CANDIDATES (data-backed edges):\n'+'\n'.join(f"  {c['source_id']}: {c['title'][:60]} mkt={c['market_price']:.0%} model={c['model_prob']:.0%} edge={c['edge']:+.1%} {c['recommendation']}" for c in cands)
+        sys_p=f'''You are the AI trading interface for Karpathy Kapital, an autonomous prediction market fund trading REAL MONEY on Kalshi.
+Full system context:
+{ctx}{live_ctx}{scan_ctx}
+
+ACTIONS — these execute immediately when you output them:
+1. [TRADE: ticker=KXCPI-26APR-T0.8 side=YES amount=25 force=true] — place a trade NOW
+2. [SEARCH: keyword] — search Kalshi for markets matching keyword, returns results inline
+3. [SCAN] — show latest data-backed opportunities from scanner
+4. [COMMAND: text] — ONLY for master agent ops (explore tools, set agents, heal). NEVER for trades or searches.
+
+RULES:
+- When the user says to trade, output [TRADE: ... force=true]. Do not queue. Do not ask. Execute.
+- When the user asks to find/search markets, output [SEARCH: keyword]. Do not queue a command.
+- Output exactly ONE tag per action. Never duplicate.
+- Keep responses to 2-3 lines. No essays, no tables, no markdown headers.
+- This is real money. Be direct.'''
         r=client.messages.create(model='claude-sonnet-4-6',max_tokens=1000,system=sys_p,
             messages=[*history,{'role':'user','content':msg}])
         resp=r.content[0].text
@@ -77,13 +121,331 @@ async def chat(req:Request):
         for cmd in cmds:
             w('INSERT INTO agent_commands(ts,command,status) VALUES(?,?,?)',
               (datetime.now(timezone.utc).isoformat(),cmd,'pending'))
-        return JSONResponse({'response':resp,'commands_queued':cmds})
+        # Execute trades
+        trades_executed=[]
+        trade_tags=re.findall(r'\[TRADE: ([^\]]+)\]',resp)
+        for tag in trade_tags:
+            parts=dict(re.findall(r'(\w+)=(\S+)',tag))
+            if parts.get('ticker'):
+                import httpx
+                try:
+                    trade_req={'ticker':parts['ticker'],'side':parts.get('side','YES'),
+                        'amount':float(parts.get('amount',0)),'force':parts.get('force','false').lower()=='true',
+                        'mode':parts.get('mode','paper')}
+                    # Call our own trade endpoint
+                    async with httpx.AsyncClient() as hc:
+                        tr=await hc.post('http://localhost:8000/api/trade',json=trade_req,timeout=30)
+                        result=tr.json()
+                        trades_executed.append(result)
+                except Exception as te: trades_executed.append({'error':str(te),'ticker':parts.get('ticker')})
+        # Execute searches
+        search_results=[]
+        search_tags=re.findall(r'\[SEARCH: ([^\]]+)\]',resp)
+        for keyword in search_tags:
+            try:
+                import requests as _req
+                kw=keyword.strip(); kw_lower=kw.lower()
+                headers={'Accept':'application/json'}
+                # Search via events endpoint (has titles, subtitles, categories)
+                cursor=None
+                for _ in range(8):
+                    params={'limit':200,'status':'open'}
+                    if cursor: params['cursor']=cursor
+                    r=_req.get('https://api.elections.kalshi.com/trade-api/v2/events',headers=headers,params=params,timeout=15)
+                    if r.status_code!=200: break
+                    data=r.json(); events=data.get('events',[])
+                    for e in events:
+                        haystack=((e.get('title','')or'')+'|'+(e.get('sub_title','')or'')+'|'+(e.get('event_ticker','')or'')+'|'+(e.get('category','')or'')).lower()
+                        if kw_lower in haystack:
+                            # Fetch markets for this event
+                            try:
+                                r2=_req.get(f'https://api.elections.kalshi.com/trade-api/v2/events/{e["event_ticker"]}',headers=headers,timeout=10)
+                                if r2.status_code==200:
+                                    for m in r2.json().get('markets',[]):
+                                        yp=m.get('yes_ask',0) or 0; yp=yp/100 if yp>1 else yp
+                                        search_results.append({'ticker':m.get('ticker',''),'title':(e.get('title','')+(': '+(m.get('title','')or'')[:50]) if m.get('title') else '')[:100],'yes_price':yp,'volume_24h':m.get('volume_24h',0) or 0,'close_time':m.get('close_date','')or m.get('expiration_time','')or''})
+                            except: pass
+                    cursor=data.get('cursor')
+                    if not cursor or not events or len(search_results)>=15: break
+                # Also search local DB
+                local=q("SELECT source_id,title,yes_price,volume_24h,close_time FROM contracts WHERE title LIKE ? AND resolution IS NULL ORDER BY close_time LIMIT 10",('%'+kw+'%',),db=TRADE_DB)
+                for m in local:
+                    if not any(s['ticker']==m['source_id'] for s in search_results):
+                        search_results.append({'ticker':m['source_id'],'title':m['title'],'yes_price':m['yes_price'],'volume_24h':m['volume_24h'] or 0,'close_time':m['close_time'] or ''})
+            except Exception as se:
+                search_results.append({'ticker':'ERROR','title':str(se)[:100],'yes_price':0,'volume_24h':0,'close_time':''})
+        # Execute scans
+        scan_results=[]
+        if '[SCAN]' in resp:
+            scan_results=q("SELECT source_id,title,market_price,model_prob,edge,confidence,recommendation FROM scan_candidates WHERE ABS(edge)>0.03 ORDER BY ts DESC, ABS(edge) DESC LIMIT 10",db=TRADE_DB)
+        return JSONResponse({'response':resp,'commands_queued':cmds,'trades':trades_executed,'search':search_results,'scan':scan_results})
     except Exception as e: return JSONResponse({'error':str(e)},500)
+
+@app.post('/api/trade')
+async def api_trade(req:Request):
+    """Execute a trade from the chat interface.
+    Fetches contract from Kalshi, runs data modifiers, computes edge, places trade.
+    Supports paper trades always. Live trades only if LIVE_TRADING_ENABLED=true.
+    """
+    try:
+        b=await req.json()
+        ticker=b.get('ticker','').strip()
+        side=b.get('side','YES').upper()
+        amount=float(b.get('amount',0))
+        force=b.get('force',False)  # skip edge check (manual override)
+        mode=b.get('mode','paper')  # 'paper' or 'live'
+        if not ticker: return JSONResponse({'error':'ticker required'},400)
+        if side not in ('YES','NO'): return JSONResponse({'error':'side must be YES or NO'},400)
+
+        from tools.kalshi import KalshiTool
+        from model.probability_model import estimate_probability
+        from model.edge_calculator import compute_edge
+        from model.data_modifiers import get_modifiers_for_contract
+        from database.models import Contract
+        from database.db import Database
+        from config import load_config
+
+        config=load_config()
+        kalshi=KalshiTool(mock_mode=False)
+
+        # Fetch contract from Kalshi
+        market=kalshi.fetch_single_market(ticker)
+        if not market: return JSONResponse({'error':f'Contract {ticker} not found on Kalshi'},404)
+        if market.get('resolved'): return JSONResponse({'error':f'Contract {ticker} already resolved'},400)
+
+        mp=market.get('yes_price',0)
+        title=market.get('title','')
+        category=market.get('category','economics')
+        close_time_str=market.get('close_time','')
+        close_time=None
+        if close_time_str:
+            try: close_time=datetime.fromisoformat(close_time_str.replace('Z','+00:00'))
+            except: pass
+
+        # Run data modifiers
+        mods=get_modifiers_for_contract(source_id=ticker,category=category,market_price=mp,title=title,close_time=close_time)
+
+        # Build contract object
+        contract=Contract(id=0,title=title,source='kalshi',source_id=ticker,category=category,
+            yes_price=mp,close_time=close_time,open_time=datetime.now(timezone.utc),
+            volume_24h=market.get('volume_24h',0))
+
+        # Estimate probability
+        estimate=estimate_probability(contract,modifiers=mods,config=config)
+        edge_result=compute_edge(estimate,mp,config)
+
+        mod_info=[{'name':m.name,'direction':m.direction,'weight':m.weight,'source':m.source} for m in mods]
+        analysis={'ticker':ticker,'title':title,'market_price':mp,'model_prob':round(estimate.probability,4),
+            'edge':round(edge_result.edge,4),'confidence':estimate.confidence,
+            'recommendation':edge_result.recommendation,'kelly_fraction':round(edge_result.kelly_fraction,4),
+            'modifiers':mod_info,'n_modifiers':len(mods)}
+
+        # Determine if we should trade
+        if not force and edge_result.recommendation in ('PASS','WATCH'):
+            analysis['action']='DECLINED'
+            analysis['reason']=f'Model says {edge_result.recommendation} (edge={edge_result.edge:+.1%}, confidence={estimate.confidence}). Use force=true to override.'
+            return JSONResponse(analysis)
+
+        # Calculate bet amount
+        if amount>0:
+            bet_amount=min(amount,config.bankroll*config.kelly_max_bet_pct)
+        else:
+            bet_amount=edge_result.bet_amount
+        if bet_amount<=0:
+            analysis['action']='DECLINED'
+            analysis['reason']='Kelly sizing says $0 (edge too small)'
+            return JSONResponse(analysis)
+
+        entry_price=mp if side=='YES' else (1-mp)
+
+        # Place trade
+        db=Database(TRADE_DB)
+        contract_id=db.upsert_contract(contract)
+
+        if mode=='live' and config.live_trading_enabled:
+            # Live trade through guard
+            from live.guard import check_guard
+            from live.kalshi_trader import KalshiTrader
+            guard_ok,guard_msg=check_guard(config,db,bet_amount)
+            if not guard_ok:
+                analysis['action']='BLOCKED'
+                analysis['reason']=f'Live guard: {guard_msg}'
+                db.close()
+                return JSONResponse(analysis)
+            trader=KalshiTrader(config)
+            shares=max(1,int(bet_amount/entry_price))
+            order=trader.place_order(ticker,side.lower(),shares,entry_price)
+            if order:
+                db.insert_live_trade({'contract_id':contract_id,'kalshi_order_id':order.get('order_id',''),
+                    'kalshi_ticker':ticker,'side':side,'entry_price':entry_price,'shares':shares,
+                    'cost':round(shares*entry_price,2),'max_payout':shares,
+                    'model_prob':estimate.probability,'edge_at_entry':edge_result.edge})
+                analysis['action']='LIVE_TRADE'
+                analysis['shares']=shares
+                analysis['cost']=round(shares*entry_price,2)
+            else:
+                analysis['action']='LIVE_FAILED'
+                analysis['reason']='Order placement failed'
+        else:
+            # Paper trade
+            db.insert_paper_trade({'contract_id':contract_id,'side':side,'entry_price':entry_price,
+                'model_prob':estimate.probability,'kelly_fraction':edge_result.kelly_fraction,
+                'bet_amount':bet_amount})
+            analysis['action']='PAPER_TRADE'
+            analysis['bet_amount']=round(bet_amount,2)
+
+        db.close()
+        return JSONResponse(analysis)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return JSONResponse({'error':str(e)},500)
+
+@app.get('/api/scan')
+def api_scan():
+    """Return recent scan candidates with real data-backed edges."""
+    cands=q("SELECT * FROM scan_candidates ORDER BY ts DESC, ABS(edge) DESC LIMIT 20",db=TRADE_DB)
+    return {'candidates':cands}
 
 @app.get('/api/status')
 def api_status():
     d=get_data(); last=d['logs'][0] if d['logs'] else {}
     return {'last_action':last.get('msg',''),'last_ts':to_et(last.get('ts','')),'pnl':float(d['res'].get('pnl') or 0)}
+
+@app.get('/api/commands')
+def api_commands():
+    cmds=q("SELECT id,ts,command,status,result,executed_at FROM agent_commands ORDER BY ts DESC LIMIT 20")
+    return {'commands':cmds}
+
+@app.get('/api/data_feeds')
+def api_data_feeds():
+    """Return real-time data feed status — reads from smart_trader log."""
+    import subprocess
+    try:
+        result=subprocess.run(['tail','-1','/tmp/smart_trader.log'],capture_output=True,text=True,timeout=2)
+        line=result.stdout.strip()
+        # Parse: STATUS | BTC=$71,720 WTI=$98.30 SPX=$6,854 GOLD=$4,780 | DVOL=47.5 ATM_IV=42.6 | ...
+        feeds={}
+        if 'STATUS' in line:
+            parts=line.split('|')
+            for part in parts:
+                for item in part.strip().split():
+                    if '=' in item:
+                        k,v=item.split('=',1)
+                        feeds[k.strip()]=v.strip().replace('$','').replace(',','')
+        # Also read model_adjustments.json if it exists
+        adjustments={}
+        adj_path=os.path.join(os.path.dirname(__file__),'model_adjustments.json')
+        if os.path.exists(adj_path):
+            with open(adj_path) as f: adjustments=json.load(f)
+        # Read model accuracy
+        accuracy=q("SELECT * FROM model_accuracy ORDER BY ts DESC LIMIT 1",db=TRADE_DB)
+        return {'feeds':feeds,'adjustments':adjustments,'accuracy':accuracy[0] if accuracy else {},'raw_line':line}
+    except: return {'feeds':{},'adjustments':{},'accuracy':{},'raw_line':''}
+
+@app.get('/api/live_events')
+def api_live_events():
+    """Return recent trader events — thinking, scanning, trading, data ingestion."""
+    events=q("SELECT ts,event_type,message,data FROM trader_events ORDER BY id DESC LIMIT 50",db=TRADE_DB)
+    return {'events':events}
+
+@app.get('/api/pnl_timeline')
+def api_pnl_timeline():
+    """Return cumulative P&L timeline from scalper trades."""
+    trades=q("""SELECT ts,ticker,side,entry_price,exit_price,count,cost,pnl,status,edge,staleness_ms
+        FROM scalper_trades ORDER BY ts""",db=TRADE_DB)
+    # Build cumulative P&L series
+    cumulative=0; timeline=[]; fees_total=0
+    for t in trades:
+        pnl=t.get('pnl') or 0
+        cost=t.get('cost') or 0
+        entry=t.get('entry_price') or 0
+        count=t.get('count') or 0
+        fee=0.07*entry*(1-entry)*count if entry else 0
+        if t.get('status')!='open':
+            cumulative+=pnl
+            fees_total+=fee*2  # entry+exit
+        timeline.append({'ts':t['ts'],'ticker':t['ticker'],'side':t['side'],
+            'pnl':round(pnl,4),'cumulative':round(cumulative,2),
+            'cost':round(cost,2),'status':t['status'],
+            'edge':t.get('edge',0),'stale_ms':t.get('staleness_ms',0)})
+    return {'timeline':timeline,'total_pnl':round(cumulative,2),
+            'total_fees':round(fees_total,2),'total_trades':len(trades),
+            'open':sum(1 for t in trades if t.get('status')=='open'),
+            'closed':sum(1 for t in trades if t.get('status')!='open')}
+
+@app.get('/api/health')
+def api_health():
+    """Run health checks across all systems. Returns list of checks with status."""
+    import subprocess,time
+    checks=[]
+    def chk(name,fn):
+        t0=time.time()
+        try:
+            ok,detail=fn()
+            checks.append({'name':name,'ok':ok,'detail':detail,'ms':int((time.time()-t0)*1000)})
+        except Exception as e:
+            checks.append({'name':name,'ok':False,'detail':str(e)[:200],'ms':int((time.time()-t0)*1000)})
+    # 1. Database connectivity
+    def ck_db():
+        r=q('SELECT COUNT(*) n FROM agent_log')
+        return (bool(r),f'{r[0]["n"]} log rows' if r else 'no rows')
+    chk('Main DB',ck_db)
+    def ck_trade_db():
+        r=q("SELECT COUNT(*) n FROM paper_trades",db=TRADE_DB)
+        return (bool(r),f'{r[0]["n"]} trades' if r else 'no rows')
+    chk('Trade DB',ck_trade_db)
+    # 2. Recent errors in agent_log
+    def ck_errors():
+        cutoff=(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
+        errs=q("SELECT COUNT(*) n FROM agent_log WHERE lvl='ERROR' AND ts>?",(cutoff,))
+        n=errs[0]['n'] if errs else 0
+        return (n<5,f'{n} errors in last hour')
+    chk('Error rate',ck_errors)
+    # 3. Tests
+    def ck_tests():
+        r=subprocess.run(['python','-m','pytest','tests/','-q','--tb=line'],capture_output=True,text=True,timeout=120,cwd='/home/jovyan/workspace/prediction-agent')
+        m=re.search(r'(\d+) passed',r.stdout+r.stderr)
+        n=int(m.group(1)) if m else 0
+        failed=re.search(r'(\d+) failed',r.stdout+r.stderr)
+        f=int(failed.group(1)) if failed else 0
+        return (r.returncode==0 and n>=139,f'{n} passed, {f} failed')
+    chk('Tests',ck_tests)
+    # 4. Module imports
+    def ck_imports():
+        mods=['dashboard','config','model.probability_model','tools.tool_registry','database.db','master_agent.observe','master_agent.confidence_gate']
+        bad=[]
+        for mod in mods:
+            r=subprocess.run(['python','-c',f'import {mod}'],capture_output=True,text=True,timeout=10,cwd='/home/jovyan/workspace/prediction-agent')
+            if r.returncode!=0: bad.append(mod)
+        return (not bad,f'{len(mods)-len(bad)}/{len(mods)} ok' + (f' FAIL: {",".join(bad)}' if bad else ''))
+    chk('Imports',ck_imports)
+    # 5. Pending commands stuck
+    def ck_stuck():
+        cutoff=(datetime.now(timezone.utc)-timedelta(hours=2)).isoformat()
+        stuck=q("SELECT COUNT(*) n FROM agent_commands WHERE status='pending' AND ts<?",(cutoff,))
+        n=stuck[0]['n'] if stuck else 0
+        return (n==0,f'{n} commands pending >2h')
+    chk('Stuck commands',ck_stuck)
+    # 6. Disk / DB size
+    def ck_disk():
+        sz1=os.path.getsize(DB) if os.path.exists(DB) else 0
+        sz2=os.path.getsize(TRADE_DB) if os.path.exists(TRADE_DB) else 0
+        return (sz1<500_000_000 and sz2<500_000_000,f'main={sz1//1024}KB trade={sz2//1024}KB')
+    chk('DB size',ck_disk)
+    # 7. Dashboard endpoints
+    def ck_endpoints():
+        import urllib.request
+        bad=[]
+        for ep in ['/api/status','/api/commands','/api/data_feeds']:
+            try:
+                r=urllib.request.urlopen(f'http://localhost:8000{ep}',timeout=3)
+                if r.status!=200: bad.append(ep)
+            except: bad.append(ep)
+        return (not bad,f'{3-len(bad)}/3 endpoints ok' + (f' FAIL: {",".join(bad)}' if bad else ''))
+    chk('Endpoints',ck_endpoints)
+    total=len(checks); ok=sum(1 for c in checks if c['ok'])
+    return {'checks':checks,'summary':f'{ok}/{total} passing','healthy':ok==total,
+            'ts':datetime.now(timezone.utc).isoformat()}
 
 CSS='''
 :root{--bg:#080810;--bg2:#0d0d1a;--bg3:#0a0a12;--bd:#1a1a2e;--text:#ccc;--dim:#555;--accent:#7c3aed;}
@@ -112,6 +474,7 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,'SF Pro Di
   .pane.active{display:grid;}
   #pane-dash.active{grid-template-columns:1fr 1fr;gap:0 24px;}
   #pane-chat.active{display:flex;flex-direction:column;}
+  #pane-pos.active{grid-template-columns:1fr 1fr;gap:0 24px;}
   #pane-cmds.active, #pane-tools.active{grid-template-columns:1fr 1fr;gap:0 24px;}
 }
 /* ── Cards ── */
@@ -204,6 +567,45 @@ def home():
     chs=''.join(cr(c) for c in d['changes']) or '<div style="color:#333;padding:12px">No changes yet</div>'
     cmds_h=''.join(cmdr(c) for c in d['cmds']) or '<div style="color:#333;padding:12px">No commands yet</div>'
     tools_h=''.join(toolr(t) for t in d['tools']) or '<div style="color:#333;padding:12px">Explorer agents will populate this</div>'
+    def posr(p):
+        st=p.get('status','open'); sc_={'open':'#ffaa00','won':'#00ff88','lost':'#ff4444'}.get(st,'#666')
+        sl_={'open':'OPEN','won':'WON','lost':'LOST'}.get(st,st.upper())
+        edge=p.get('model_prob',0)-p.get('entry_price',0)
+        pnl_s=f"${p.get('pnl',0) or 0:+.2f}" if st!='open' else '—'
+        pnl_c='#00ff88' if (p.get('pnl') or 0)>0 else '#ff4444' if (p.get('pnl') or 0)<0 else '#888'
+        title=(p.get('title','') or '')[:65]
+        return f'<div class="change-row"><div style="display:flex;justify-content:space-between;align-items:center"><span style="color:{sc_};font-size:11px;font-weight:700">{sl_} · {p.get("side","")}</span><span style="color:{pnl_c};font-size:13px;font-weight:700">{pnl_s}</span></div><div style="color:#ddd;font-size:13px;margin-top:3px">{title}</div><div style="color:#888;font-size:11px;margin-top:2px">entry={p.get("entry_price",0):.0%} model={p.get("model_prob",0):.0%} edge={edge:+.1%} bet=${p.get("bet_amount",0):.2f}</div><div style="color:var(--dim);font-size:10px;margin-top:2px">{p.get("source_id","")} · opened {to_et(p.get("opened_at",""))}</div></div>'
+    open_pos=[p for p in d['positions'] if p.get('status')=='open']
+    closed_pos=[p for p in d['positions'] if p.get('status')!='open']
+    pos_open_h=''.join(posr(p) for p in open_pos) or '<div style="color:#333;padding:12px">No open positions</div>'
+    pos_closed_h=''.join(posr(p) for p in closed_pos) or '<div style="color:#333;padding:12px">No settled trades yet</div>'
+    def wtir(w):
+        st=w.get('status','open'); sc_={'open':'#ffaa00','won':'#00ff88','lost':'#ff4444'}.get(st,'#666')
+        sl_={'open':'OPEN','won':'WON','lost':'LOST'}.get(st,st.upper())
+        pnl_v=w.get('pnl') or 0; pnl_s=f"${pnl_v:+.2f}" if st!='open' else f"${w.get('cost',0):.2f} at risk"
+        pnl_c='#00ff88' if pnl_v>0 else '#ff4444' if pnl_v<0 else '#888'
+        edge=w.get('edge_at_entry',0)
+        return f'<div class="change-row"><div style="display:flex;justify-content:space-between;align-items:center"><span style="color:{sc_};font-size:11px;font-weight:700">{sl_} · {w.get("side","").upper()}</span><span style="color:{pnl_c};font-size:13px;font-weight:700">{pnl_s}</span></div><div style="color:#ddd;font-size:13px;margin-top:3px">WTI &gt; ${w.get("strike",0):.2f}</div><div style="color:#888;font-size:11px;margin-top:2px">{w.get("ticker","")} · entry={w.get("entry_price",0):.0%} model={w.get("model_prob",0):.0%} edge={edge:+.1%} x{w.get("shares",0)}</div><div style="color:var(--dim);font-size:10px;margin-top:2px">opened {to_et(w.get("opened_at",""))}</div></div>'
+    wti_open=[w for w in d['wti'] if w.get('status')=='open']
+    wti_closed=[w for w in d['wti'] if w.get('status')!='open']
+    wti_open_h=''.join(wtir(w) for w in wti_open) or '<div style="color:#333;padding:12px">No WTI positions</div>'
+    wti_closed_h=''.join(wtir(w) for w in wti_closed) or '<div style="color:#333;padding:12px">No settled WTI trades</div>'
+    wti_exposure=sum(w.get('cost',0) for w in wti_open)
+    wti_pnl=sum(w.get('pnl',0) or 0 for w in wti_closed)
+    # Leaderboard: combine all settled positions, rank by P&L
+    all_settled=[]
+    for p in closed_pos:
+        pv=p.get('pnl') or 0; title=(p.get('title','') or '')[:55]
+        all_settled.append({'pnl':pv,'title':title,'side':p.get('side',''),'entry':p.get('entry_price',0),'bet':p.get('bet_amount',0),'source':p.get('source_id','')})
+    for w in wti_closed:
+        pv=w.get('pnl') or 0
+        all_settled.append({'pnl':pv,'title':f"WTI >{w.get('strike',0):.2f}",'side':w.get('side',''),'entry':w.get('entry_price',0),'bet':w.get('cost',0),'source':w.get('ticker','')})
+    winners=sorted([s for s in all_settled if s['pnl']>0],key=lambda x:-x['pnl'])[:8]
+    losers=sorted([s for s in all_settled if s['pnl']<0],key=lambda x:x['pnl'])[:8]
+    def ldr(s,color):
+        return f'<div class="change-row"><div style="display:flex;justify-content:space-between"><span style="color:#ddd;font-size:12px">{s["title"]}</span><span style="color:{color};font-size:13px;font-weight:700">${s["pnl"]:+.2f}</span></div><div style="color:#888;font-size:10px">{s["side"]} entry={s["entry"]:.0%} bet=${s["bet"]:.0f} · {s["source"]}</div></div>'
+    winners_h=''.join(ldr(s,'#00ff88') for s in winners) or '<div style="color:#333;padding:12px">No winners yet</div>'
+    losers_h=''.join(ldr(s,'#ff4444') for s in losers) or '<div style="color:#333;padding:12px">No losers yet</div>'
     return f"""<!DOCTYPE html>
 <html lang='en'><head>
 <meta charset='UTF-8'>
@@ -217,9 +619,13 @@ def home():
 </div>
 <div class='tab-bar'>
   <button class='tab active' id='tab-dash' onclick='sw("dash")'><span class='tab-icon'>📊</span>Dashboard</button>
+  <button class='tab' id='tab-pos' onclick='sw("pos")'><span class='tab-icon'>💰</span>Positions</button>
   <button class='tab' id='tab-chat' onclick='sw("chat")'><span class='tab-icon'>💬</span>Chat</button>
   <button class='tab' id='tab-cmds' onclick='sw("cmds")'><span class='tab-icon'>⚡</span>Commands</button>
+  <button class='tab' id='tab-live' onclick='sw("live")'><span class='tab-icon'>🧠</span>Live</button>
+  <button class='tab' id='tab-pnl' onclick='sw("pnl")'><span class='tab-icon'>📈</span>P&L</button>
   <button class='tab' id='tab-tools' onclick='sw("tools")'><span class='tab-icon'>🔬</span>Tools</button>
+  <button class='tab' id='tab-health' onclick='sw("health")'><span class='tab-icon'>🩺</span>Health</button>
 </div>
 <!-- DASHBOARD TAB -->
 <div id='pane-dash' class='pane active'>
@@ -251,10 +657,56 @@ def home():
     <div class='sec'>{ers}</div>
   </div>
 </div>
+<!-- POSITIONS TAB -->
+<div id='pane-pos' class='pane'>
+  <div class='col-full'>
+    <div class='grid'>
+      <div class='card'><div class='v'>{len(open_pos)+len(wti_open)}</div><div class='l'>Open</div></div>
+      <div class='card'><div class='v'>{len(closed_pos)+len(wti_closed)}</div><div class='l'>Settled</div></div>
+      <div class='card' style='border-color:{pc}33'><div class='v' style='color:{pc}'>${pnl+wti_pnl:.2f}</div><div class='l'>Total P&amp;L</div></div>
+      <div class='card'><div class='v'>${sum(p.get("bet_amount",0) for p in open_pos)+wti_exposure:.0f}</div><div class='l'>At Risk</div></div>
+    </div>
+    <div style='background:var(--bg2);border:1px solid #ff880044;border-radius:8px;padding:12px;margin-bottom:14px'>
+      <div style='color:#ff8800;font-size:12px;font-weight:700;margin-bottom:4px'>WTI CRUDE OIL DAY TRADING</div>
+      <div style='color:#888;font-size:12px'>KXWTI series · {len(wti_open)} open / {len(wti_closed)} settled · exposure ${wti_exposure:.2f} · P&amp;L ${wti_pnl:+.2f}</div>
+    </div>
+  </div>
+  <div class='col-left'>
+    <div class='sec-title'>WTI Open ({len(wti_open)})</div>
+    <div class='sec scroll-box'>{wti_open_h}</div>
+    <div class='sec-title'>Other Open ({len(open_pos)})</div>
+    <div class='sec scroll-tall'>{pos_open_h}</div>
+  </div>
+  <div class='col-right'>
+    <div class='sec-title'>WTI Settled ({len(wti_closed)})</div>
+    <div class='sec scroll-box'>{wti_closed_h}</div>
+    <div class='sec-title'>Other Settled ({len(closed_pos)})</div>
+    <div class='sec scroll-tall'>{pos_closed_h}</div>
+  </div>
+  <div class='col-full'>
+    <div style='display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px'>
+      <div>
+        <div class='sec-title' style='color:#00ff88'>Top Winners</div>
+        <div class='sec'>{winners_h}</div>
+      </div>
+      <div>
+        <div class='sec-title' style='color:#ff4444'>Top Losers</div>
+        <div class='sec'>{losers_h}</div>
+      </div>
+    </div>
+  </div>
+</div>
 <!-- CHAT TAB -->
 <div id='pane-chat' class='pane'>
   <div class='chat-wrap'>
-    <div id='msgs' class='chat-msgs'><div style='color:var(--dim);text-align:center;padding:40px 20px;font-size:14px'>Chat with your master agent.<br><br>Full system context injected. Ask anything.<br>I queue commands automatically.</div></div>
+    <div id='cmd-queue' style='background:#0d0d1a;border:1px solid #7c3aed44;border-radius:8px;padding:6px 10px;margin-bottom:6px;display:none;max-height:80px;overflow-y:auto'>
+      <div style='display:flex;justify-content:space-between;align-items:center'>
+        <span style='color:var(--accent);font-size:10px;font-weight:700'>QUEUE</span>
+        <span id='cmd-count' style='color:#888;font-size:9px'></span>
+      </div>
+      <div id='cmd-list' style='font-size:11px'></div>
+    </div>
+    <div id='msgs' class='chat-msgs'><div style='color:var(--dim);text-align:center;padding:40px 20px;font-size:14px'>Chat with your master agent.<br><br>Full system context injected. Ask anything.<br>Commands persist — queue work and walk away.</div></div>
     <div class='chat-input-wrap'>
       <div class='chat-row'>
         <textarea id='ci' rows='1' placeholder='Ask the master agent...' oninput='ar(this)'></textarea>
@@ -280,6 +732,45 @@ def home():
     <div class='sec scroll-tall'>{chs}</div>
   </div>
 </div>
+<!-- LIVE BRAIN TAB -->
+<div id='pane-live' class='pane'>
+  <div class='col-full'>
+    <div style='background:var(--bg2);border:1px solid #7c3aed44;border-radius:8px;padding:12px;margin-bottom:14px'>
+      <div style='color:var(--accent);font-size:12px;font-weight:700;margin-bottom:4px'>REAL-TIME TRADING BRAIN</div>
+      <div style='color:#888;font-size:12px'>Live data ingestion, opportunity analysis, confidence scoring, and trade execution. Auto-refreshes every 5s.</div>
+      <div id='live-feeds-bar' style='display:flex;gap:8px;flex-wrap:wrap;margin-top:8px'></div>
+    </div>
+    <div class='sec scroll-tall' id='live-events' style='font-family:monospace;font-size:12px'></div>
+  </div>
+</div>
+<!-- P&L TAB -->
+<div id='pane-pnl' class='pane'>
+  <div class='col-full'>
+    <div id='pnl-summary' style='display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap'></div>
+    <div class='sec' style='padding:14px;min-height:300px'>
+      <canvas id='pnl-chart' style='width:100%;height:300px'></canvas>
+    </div>
+    <div class='sec-title'>Trade Log</div>
+    <div class='sec scroll-tall' id='pnl-trades'></div>
+  </div>
+</div>
+<!-- HEALTH TAB -->
+<div id='pane-health' class='pane'>
+  <div class='col-full'>
+    <div style='background:var(--bg2);border:1px solid #7c3aed44;border-radius:8px;padding:12px;margin-bottom:14px'>
+      <div style='display:flex;justify-content:space-between;align-items:center'>
+        <div>
+          <div style='color:var(--accent);font-size:12px;font-weight:700;margin-bottom:4px'>SYSTEM HEALTH MONITOR</div>
+          <div style='color:#888;font-size:12px'>Tests, imports, DBs, endpoints, error rates. Auto-checks every 60s.</div>
+        </div>
+        <button class='btn' style='padding:6px 14px;font-size:11px' onclick='runHealth()'>Run Now</button>
+      </div>
+      <div id='health-summary' style='margin-top:8px;font-size:14px;font-weight:700;color:#888'>Not checked yet</div>
+      <div id='health-ts' style='color:#444;font-size:10px;margin-top:2px'></div>
+    </div>
+    <div id='health-checks' class='sec scroll-tall' style='font-size:13px'></div>
+  </div>
+</div>
 <!-- TOOLS TAB -->
 <div id='pane-tools' class='pane'>
   <div class='col-full'>
@@ -301,14 +792,179 @@ def home():
   </div>
 </div>
 <script>
-function sw(id){{document.querySelectorAll('.pane,.tab').forEach(e=>e.classList.remove('active'));document.getElementById('pane-'+id).classList.add('active');document.getElementById('tab-'+id).classList.add('active');if(id==='chat')document.getElementById('ci').focus();}}
 let H=[];
 function ar(el){{el.style.height='auto';el.style.height=Math.min(el.scrollHeight,120)+'px';}}
 function am(role,text){{const m=document.getElementById('msgs');const t=new Date().toLocaleTimeString('en-US',{{hour:'2-digit',minute:'2-digit',hour12:true}});m.innerHTML+=`<div class='msg ${{role}}'><div class='msg-bubble'>${{text}}</div><div class='msg-time'>${{t}}</div></div>`;m.scrollTop=m.scrollHeight;}}
-async function sc(){{const i=document.getElementById('ci');const msg=i.value.trim();if(!msg)return;am('user',msg);i.value='';i.style.height='auto';H.push({{role:'user',content:msg}});am('ai','...');try{{const r=await fetch('/chat',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{message:msg,history:H.slice(0,-1)}})}});const j=await r.json();const bs=document.getElementById('msgs').querySelectorAll('.msg.ai');bs[bs.length-1].querySelector('.msg-bubble').textContent=j.response||'Error';H.push({{role:'assistant',content:j.response||''}});if(j.commands_queued?.length)am('ai','Queued: '+j.commands_queued.join(', '));}}catch(e){{am('ai','Error: '+e);}}}}
+async function sc(){{const i=document.getElementById('ci');const msg=i.value.trim();if(!msg)return;am('user',msg);i.value='';i.style.height='auto';H.push({{role:'user',content:msg}});am('ai','...');try{{const r=await _f('/chat',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{message:msg,history:H.slice(0,-1)}})}});const j=await r.json();const bs=document.getElementById('msgs').querySelectorAll('.msg.ai');bs[bs.length-1].querySelector('.msg-bubble').innerHTML=(j.response||'Error').replace(/\\n/g,'<br>');H.push({{role:'assistant',content:j.response||''}});if(j.commands_queued?.length)am('ai','⚡ Queued: '+j.commands_queued.join(', '));if(j.trades?.length){{j.trades.forEach(t=>{{const col=t.action?.includes('TRADE')?'#00ff88':t.action==='DECLINED'?'#ffaa00':'#ff4444';am('ai',`<span style="color:${{col}};font-weight:700">${{t.action}}</span> ${{t.ticker}} ${{t.side||''}} mkt=${{(t.market_price*100).toFixed(0)}}c model=${{(t.model_prob*100).toFixed(0)}}c edge=${{(t.edge*100).toFixed(1)}}pp ${{t.bet_amount?'$'+t.bet_amount:''}} ${{t.reason||''}}`)}})}}if(j.search?.length){{let s='<b>MARKETS FOUND:</b><br>'+j.search.map(m=>`<span style="color:var(--accent)">${{m.ticker}}</span> ${{(m.yes_price*100).toFixed(0)}}c — ${{m.title.slice(0,70)}}`).join('<br>');am('ai',s)}}if(j.scan?.length){{let s='<b>SCAN:</b><br>'+j.scan.map(c=>`${{c.source_id}} ${{c.recommendation}} mkt=${{(c.market_price*100).toFixed(0)}}c edge=${{(c.edge*100).toFixed(1)}}pp`).join('<br>');am('ai',s)}}}}catch(e){{am('ai','Error: '+e);}}}}
 document.getElementById('ci').addEventListener('keydown',e=>{{if(e.key==='Enter'&&!e.shiftKey){{e.preventDefault();sc();}}}});
-async function sendCmd(){{const i=document.getElementById('cmi');const cmd=i.value.trim();const s=document.getElementById('cms');if(!cmd)return;s.textContent='Sending...';s.style.color='#ffaa00';try{{const r=await fetch('/command',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{command:cmd}})}});const j=await r.json();if(j.ok){{s.textContent='Queued at '+j.queued_at+' ET';s.style.color='#00ff88';i.value='';}}else s.textContent='Error: '+j.error;}}catch(e){{s.textContent='Error: '+e;s.style.color='#ff4444';}}}}
+async function sendCmd(){{const i=document.getElementById('cmi');const cmd=i.value.trim();const s=document.getElementById('cms');if(!cmd)return;s.textContent='Sending...';s.style.color='#ffaa00';try{{const r=await _f('/command',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{command:cmd}})}});const j=await r.json();if(j.ok){{s.textContent='Queued at '+j.queued_at+' ET';s.style.color='#00ff88';i.value='';}}else s.textContent='Error: '+j.error;}}catch(e){{s.textContent='Error: '+e;s.style.color='#ff4444';}}}}
 setInterval(()=>{{if(document.getElementById('pane-dash').classList.contains('active'))location.reload();}},30000);
+// Live Brain Feed
+let liveTimer=null;
+function loadLive(){{
+  if(liveTimer)return;
+  function refresh(){{
+    _f('/api/live_events').then(r=>r.json()).then(d=>{{
+      const el=document.getElementById('live-events');
+      if(!d.events||!d.events.length){{el.innerHTML='<div style=\"color:#333;padding:20px\">Waiting for trader events...</div>';return;}}
+      el.innerHTML=d.events.map(e=>{{
+        const colors={{status:'#555',scan:'#7c3aed',trade:'#00ff88',data:'#ffaa00',error:'#ff4444',calibration:'#00aaff'}};
+        const icons={{status:'📊',scan:'🔍',trade:'💰',data:'📡',error:'⚠️',calibration:'📐'}};
+        const col=colors[e.event_type]||'#888';
+        const icon=icons[e.event_type]||'📋';
+        const ts=e.ts?e.ts.slice(11,19):'';
+        let detail='';
+        if(e.data){{
+          try{{
+            const dd=JSON.parse(e.data);
+            if(dd.top_3&&dd.top_3.length){{
+              detail='<div style=\"margin-left:24px;color:#888;font-size:11px\">'+dd.top_3.map(t=>`${{t.side.toUpperCase()}} ${{t.ticker}} conf=${{(t.conf*100).toFixed(0)}}% edge=${{(t.edge*100).toFixed(1)}}c buf=${{(t.buffer*100).toFixed(1)}}%`).join(' | ')+'</div>';
+            }}
+            if(dd.btc){{
+              detail='<div style=\"margin-left:24px;color:#666;font-size:11px\">BTC=$${{Number(dd.btc).toLocaleString()}} DVOL=${{dd.dvol||\"?\"}} VIX=${{dd.vix||\"?\"}} DXY=${{dd.dxy||\"?\"}} F&G=${{dd.fear_greed||\"?\"}}</div>';
+            }}
+            if(dd.ticker){{
+              detail=`<div style=\"margin-left:24px;color:#aaa;font-size:11px\">${{dd.reasoning||''}} spot=$${{Number(dd.spot||0).toLocaleString()}} vol=${{(dd.vol*100).toFixed(1)}}%</div>`;
+            }}
+          }}catch(ex){{}}
+        }}
+        return `<div style=\"padding:6px 10px;border-bottom:1px solid #0f0f1a\"><span style=\"color:#444;font-size:10px\">${{ts}}</span> <span style=\"font-size:14px\">${{icon}}</span> <span style=\"color:${{col}};font-size:12px;font-weight:600\">${{e.event_type.toUpperCase()}}</span> <span style=\"color:#ccc;font-size:12px\">${{e.message}}</span>${{detail}}</div>`;
+      }}).join('');
+    }}).catch(()=>{{}});
+    // Also update feed badges
+    _f('/api/data_feeds').then(r=>r.json()).then(d=>{{
+      const bar=document.getElementById('live-feeds-bar');
+      if(!d.feeds)return;
+      const badges=Object.entries(d.feeds).map(([k,v])=>{{
+        const col=v&&v!=='N/A'&&v!=='0'?'#00ff88':'#333';
+        return `<span style=\"background:#0a0a12;border:1px solid ${{col}}44;color:${{col}};padding:2px 6px;border-radius:4px;font-size:10px\">${{k}}=${{v||'?'}}</span>`;
+      }}).join('');
+      bar.innerHTML=badges;
+    }}).catch(()=>{{}});
+  }}
+  refresh();
+  liveTimer=setInterval(refresh,5000);
+}}
+// P&L Timeline
+let pnlLoaded=false;
+function loadPnL(){{if(pnlLoaded)return;pnlLoaded=true;
+_f('/api/pnl_timeline').then(r=>r.json()).then(d=>{{
+  // Summary cards
+  const s=document.getElementById('pnl-summary');
+  const pc=d.total_pnl>=0?'#00ff88':'#ff4444';
+  s.innerHTML=`
+    <div class='card'><div class='v' style='color:${{pc}}'>${{d.total_pnl>=0?'+':''}}$${{d.total_pnl.toFixed(2)}}</div><div class='l'>Realized P&amp;L</div></div>
+    <div class='card'><div class='v'>${{d.total_trades}}</div><div class='l'>Total Trades</div></div>
+    <div class='card'><div class='v'>${{d.closed}}</div><div class='l'>Closed</div></div>
+    <div class='card'><div class='v'>${{d.open}}</div><div class='l'>Open</div></div>
+    <div class='card'><div class='v'>$${{d.total_fees.toFixed(2)}}</div><div class='l'>Fees Paid</div></div>`;
+  // Chart
+  const canvas=document.getElementById('pnl-chart');
+  const ctx=canvas.getContext('2d');
+  canvas.width=canvas.offsetWidth*2;canvas.height=600;
+  const tl=d.timeline.filter(t=>t.status!=='open');
+  if(tl.length<2){{ctx.fillStyle='#333';ctx.font='14px monospace';ctx.fillText('Waiting for closed trades...',20,150);return;}}
+  const vals=tl.map(t=>t.cumulative);
+  const mn=Math.min(0,...vals);const mx=Math.max(0,...vals);
+  const rng=Math.max(mx-mn,0.01);
+  const w=canvas.width;const h=canvas.height;
+  const pad={{l:60,r:20,t:20,b:40}};
+  const pw=w-pad.l-pad.r;const ph=h-pad.t-pad.b;
+  // Grid
+  ctx.strokeStyle='#1a1a2e';ctx.lineWidth=1;
+  const nGrid=5;
+  for(let i=0;i<=nGrid;i++){{const y=pad.t+ph*i/nGrid;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();
+    const v=mx-rng*i/nGrid;ctx.fillStyle='#555';ctx.font='11px monospace';ctx.textAlign='right';ctx.fillText('$'+v.toFixed(2),pad.l-8,y+4);}}
+  // Zero line
+  const zeroY=pad.t+ph*(mx/(rng||1));
+  ctx.strokeStyle='#333';ctx.lineWidth=2;ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(pad.l,zeroY);ctx.lineTo(w-pad.r,zeroY);ctx.stroke();ctx.setLineDash([]);
+  // P&L line
+  ctx.beginPath();ctx.lineWidth=2;
+  for(let i=0;i<tl.length;i++){{
+    const x=pad.l+pw*i/(tl.length-1);
+    const y=pad.t+ph*(mx-tl[i].cumulative)/rng;
+    if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+  }}
+  const lastVal=vals[vals.length-1];
+  ctx.strokeStyle=lastVal>=0?'#00ff88':'#ff4444';ctx.stroke();
+  // Fill under curve
+  ctx.lineTo(pad.l+pw,zeroY);ctx.lineTo(pad.l,zeroY);ctx.closePath();
+  ctx.fillStyle=lastVal>=0?'rgba(0,255,136,0.08)':'rgba(255,68,68,0.08)';ctx.fill();
+  // Dots for each trade
+  for(let i=0;i<tl.length;i++){{
+    const x=pad.l+pw*i/(tl.length-1);
+    const y=pad.t+ph*(mx-tl[i].cumulative)/rng;
+    ctx.beginPath();ctx.arc(x,y,3,0,Math.PI*2);
+    ctx.fillStyle=tl[i].pnl>=0?'#00ff88':'#ff4444';ctx.fill();
+  }}
+  // Time labels
+  ctx.fillStyle='#555';ctx.font='10px monospace';ctx.textAlign='center';
+  const step=Math.max(1,Math.floor(tl.length/6));
+  for(let i=0;i<tl.length;i+=step){{
+    const x=pad.l+pw*i/(tl.length-1);
+    const ts=tl[i].ts||'';const short=ts.slice(11,19);
+    ctx.fillText(short,x,h-pad.b+16);
+  }}
+  // Trade log
+  const logEl=document.getElementById('pnl-trades');
+  logEl.innerHTML=d.timeline.slice().reverse().map(t=>{{
+    const col=t.status==='open'?'#ffaa00':(t.pnl>=0?'#00ff88':'#ff4444');
+    const pnlStr=t.status==='open'?'OPEN':'$'+(t.pnl>=0?'+':'')+t.pnl.toFixed(4);
+    return `<div class='change-row'><div style='display:flex;justify-content:space-between'><span style='color:${{col}};font-size:11px;font-weight:700'>${{t.side.toUpperCase()}} ${{t.status.toUpperCase()}}</span><span style='color:${{col}};font-size:13px;font-weight:700'>${{pnlStr}}</span></div><div style='color:#ddd;font-size:12px;margin-top:2px'>${{t.ticker}}</div><div style='color:#888;font-size:11px'>edge=${{(t.edge*100).toFixed(1)}}c stale=${{t.stale_ms}}ms cost=$${{t.cost.toFixed(2)}} cum=$${{t.cumulative.toFixed(2)}}</div><div style='color:var(--dim);font-size:10px'>${{t.ts}}</div></div>`;
+  }}).join('');
+}}).catch(e=>console.error('PnL load error:',e));}}
+// Load PnL when tab selected
+const origSw=sw;
+// Detect base path for proxy compatibility
+const _bp=(()=>{{const p=window.location.pathname;const i=p.indexOf('/proxy/');if(i>=0){{const end=p.indexOf('/',i+7);return end>=0?p.slice(0,end):p;}}return '';}})();
+function _f(path,opts){{return fetch(_bp+path,opts);}}
+// Health monitor
+let healthTimer=null;
+function runHealth(){{
+  document.getElementById('health-summary').textContent='Running checks...';
+  document.getElementById('health-summary').style.color='#ffaa00';
+  _f('/api/health').then(r=>r.json()).then(d=>{{
+    const s=document.getElementById('health-summary');
+    s.textContent=d.healthy?'ALL SYSTEMS GO — '+d.summary:'ISSUES DETECTED — '+d.summary;
+    s.style.color=d.healthy?'#00ff88':'#ff4444';
+    document.getElementById('health-ts').textContent='Last check: '+new Date().toLocaleTimeString();
+    const el=document.getElementById('health-checks');
+    el.innerHTML=d.checks.map(c=>{{
+      const icon=c.ok?'✅':'❌';
+      const col=c.ok?'#00ff88':'#ff4444';
+      return `<div class='change-row'><div style='display:flex;justify-content:space-between;align-items:center'><span style='font-size:14px'>${{icon}} <span style='color:${{col}};font-size:13px;font-weight:600'>${{c.name}}</span></span><span style='color:#444;font-size:10px'>${{c.ms}}ms</span></div><div style='color:#888;font-size:12px;margin-top:3px'>${{c.detail}}</div></div>`;
+    }}).join('');
+  }}).catch(e=>{{
+    document.getElementById('health-summary').textContent='Check failed: '+e;
+    document.getElementById('health-summary').style.color='#ff4444';
+  }});
+}}
+function startHealthTimer(){{if(!healthTimer)healthTimer=setInterval(runHealth,60000);}}
+// Command queue
+let cmdTimer=null;
+async function queueCmd(cmd){{
+  if(!cmd)return;
+  try{{const r=await _f('/command',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{command:cmd}})}});
+    const j=await r.json();if(j.ok){{am('ai','⚡ Queued: '+cmd);refreshCmds();}}
+  }}catch(e){{am('ai','Queue error: '+e);}}
+}}
+function refreshCmds(){{
+  _f('/api/commands').then(r=>r.json()).then(d=>{{
+    const q=document.getElementById('cmd-queue');const list=document.getElementById('cmd-list');const cnt=document.getElementById('cmd-count');
+    if(!d.commands||!d.commands.length){{q.style.display='none';return;}}
+    q.style.display='block';
+    const pending=d.commands.filter(c=>c.status==='pending');
+    cnt.textContent=pending.length+' pending / '+d.commands.length+' total';
+    list.innerHTML=d.commands.slice(0,3).map(c=>{{
+      const sc={{'pending':'#ffaa00','done':'#00ff88','error':'#ff4444'}}[c.status]||'#888';
+      const icon={{'pending':'⏳','done':'✅','error':'❌'}}[c.status]||'📋';
+      const ts=c.ts?c.ts.slice(11,19):'';
+      const res=c.result?` → ${{c.result.slice(0,60)}}`:'';
+      return `<div style="padding:4px 0;border-bottom:1px solid #111"><span style="font-size:12px">${{icon}}</span> <span style="color:${{sc}};font-size:11px;font-weight:600">${{c.status.toUpperCase()}}</span> <span style="color:#ccc;font-size:12px">${{c.command.slice(0,80)}}</span><span style="color:#555;font-size:11px">${{res}}</span> <span style="color:#444;font-size:10px">${{ts}}</span></div>`;
+    }}).join('');
+  }}).catch(()=>{{}});
+}}
+function sw(id){{document.querySelectorAll('.pane,.tab').forEach(e=>e.classList.remove('active'));document.getElementById('pane-'+id).classList.add('active');document.getElementById('tab-'+id).classList.add('active');if(id==='chat'){{document.getElementById('ci').focus();refreshCmds();if(!cmdTimer)cmdTimer=setInterval(refreshCmds,10000);}}if(id==='pnl')loadPnL();if(id==='live')loadLive();if(id==='health'){{runHealth();startHealthTimer();}}}}
 </script></body></html>"""
 
 if __name__=='__main__':
