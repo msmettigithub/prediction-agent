@@ -36,7 +36,7 @@ _cgecko = requests.Session()
 # Strategy params
 MAX_YES_PRICE = 0.22      # entry: buy NO when YES below this
 MIN_EDGE = 0.05           # minimum vol-model edge to enter
-MAX_BET = 15.0            # per trade
+MAX_BET = 7.0             # per trade — small while learning
 MIN_BALANCE = 100.0       # stop trading below this
 MAX_TRADES_PER_CYCLE = 3  # don't flood
 STALE_ORDER_SECONDS = 180 # cancel unfilled orders after 3 min
@@ -386,6 +386,7 @@ def main():
     last_code_review = 0
     last_idea_generation = 0
     llm_ideas = []  # ideas from LLM, fed into entry pipeline
+    llm_activity = {}  # tracks what each LLM role is doing
     balance = 0
     cached_markets = {}
     existing_tickers = set()
@@ -484,6 +485,12 @@ def main():
                         intel_direction=view.direction if view else 0,
                         intel_signals=[s.source for s in view.signals] if view else [],
                     )
+                    llm_activity['Trade Reviewer'] = {
+                        'model': review.model, 'status': 'approved' if review.approved else 'rejected',
+                        'latency': f'{review.latency_ms}ms',
+                        'last': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+                        'summary': f"{e['ticker']} {e['side'].upper()}: {review.reasoning[:80]}"
+                    }
                     if not review.approved:
                         log(f"LLM REJECTED: {e['ticker']} — {review.reasoning} "
                             f"risks={review.risks} ({review.model} {review.latency_ms}ms)", 'WARN')
@@ -632,6 +639,7 @@ def main():
                     'unrealized': h.unrealized_pnl, 'realizable': h.realizable_pnl,
                     'pnl_pct': h.pnl_pct, 'win_prob': h.win_probability, 'ev': h.expected_pnl,
                 } for h in sorted(hold_reports, key=lambda h: h.realizable_pnl)[:20]],
+                'llm_activity': llm_activity,
                 'llm_ideas': llm_ideas,
                 'exit_candidates': [{'reason': r, 'ticker': ef.ticker, 'pnl': ef.realized_pnl,
                                      'profitable': ef.is_profitable} for r, ef, _ in exit_candidates],
@@ -684,9 +692,16 @@ def main():
                             except: pass
                         avail.append({'ticker':ticker,'yes_ask':ya,'no_ask':na,'hours':hours,'strike':strike or 0})
 
+                    t_llm = time.time()
                     llm_ideas = generate_trade_ideas(
                         balance=balance, total_exposure=total_exp, realized_pnl=total_pnl,
                         positions=hr, intel=intel_dict, available_markets=avail)
+                    llm_activity['Idea Generator'] = {
+                        'model': 'claude-sonnet-4-6', 'status': f'{len(llm_ideas)} ideas',
+                        'latency': f'{(time.time()-t_llm)*1000:.0f}ms',
+                        'last': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+                        'summary': '; '.join(f"{i['side'].upper()} {i['ticker']}: {i.get('reason','')[:50]}" for i in llm_ideas[:2]) or 'no ideas'
+                    }
                     if llm_ideas:
                         log(f"LLM IDEAS: {json.dumps(llm_ideas, default=str)[:300]}", 'MILESTONE')
                     last_idea_generation = time.time()
@@ -701,7 +716,14 @@ def main():
                            'fair':h.current_fair,'ev':h.expected_pnl} for h in hold_reports]
                     intel_dict = {name: {'dir': v.direction, 'conv': v.conviction, 'vol': v.vol_regime}
                                  for name, v in intel.items()} if intel else {}
+                    t_llm = time.time()
                     advice = review_portfolio(hr, balance, total_exp, total_pnl, intel_dict)
+                    llm_activity['Portfolio Strategist'] = {
+                        'model': 'claude-sonnet-4-6', 'status': 'ok' if advice else 'no response',
+                        'latency': f'{(time.time()-t_llm)*1000:.0f}ms',
+                        'last': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+                        'summary': (advice or '')[:120]
+                    }
                     if advice:
                         log(f"PORTFOLIO REVIEW: {advice[:400]}", 'MILESTONE')
                     last_portfolio_review = time.time()
@@ -711,7 +733,14 @@ def main():
             if time.time() - last_code_review > 3600:
                 try:
                     from model.llm_reviewer import review_code_health
+                    t_llm = time.time()
                     health = review_code_health()
+                    llm_activity['Code Auditor'] = {
+                        'model': 'claude-sonnet-4-6', 'status': 'ok' if health else 'no response',
+                        'latency': f'{(time.time()-t_llm)*1000:.0f}ms',
+                        'last': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+                        'summary': (health or '')[:120]
+                    }
                     if health:
                         log(f"CODE REVIEW: {health[:400]}", 'MILESTONE')
                     last_code_review = time.time()

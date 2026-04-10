@@ -882,6 +882,15 @@ function loadLive(){{
           return `<div style="padding:4px 10px;display:flex;justify-content:space-between;border-bottom:1px solid #0f0f1a"><span style="color:var(--accent);font-size:12px;font-weight:600">${{s}}</span><span style="font-size:12px"><span style="color:#888">exp=$${{vexp.toFixed(0)}}</span> <span style="color:${{uc}};font-weight:600">${{vn}}pos</span></span></div>`;
         }}).join('');
       }}
+      // LLM Activity
+      const llmActs=d.llm_activity||{{}};
+      if(Object.keys(llmActs).length){{
+        html+=`<div style="padding:8px 10px;color:#e879f9;font-size:11px;font-weight:700;border-bottom:1px solid #1a1a2e">LLM MODELS ACTIVE</div>`;
+        html+=Object.entries(llmActs).map(([role,info])=>{{
+          const sc=info.status==='ok'?'#00ff88':info.status==='rejected'?'#ff4444':'#888';
+          return `<div style="padding:4px 10px;border-bottom:1px solid #0f0f1a;font-size:11px"><span style="color:#e879f9;font-weight:600">${{info.model||'?'}}</span> <span style="color:#888">→</span> <span style="color:#ddd">${{role}}</span> <span style="color:${{sc}};font-weight:600">${{info.status||'idle'}}</span> <span style="color:#555">${{info.latency||''}} ${{info.last||''}}</span><div style="color:#aaa;font-size:10px;margin-top:1px;padding-left:4px">${{info.summary||''}}</div></div>`;
+        }}).join('');
+      }}
       // LLM Ideas
       const ideas=d.llm_ideas||[];
       if(ideas.length){{
