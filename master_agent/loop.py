@@ -153,9 +153,28 @@ def _openrouter_call(model,system,user_msg,max_tokens=1000):
         json={'model':model,'max_tokens':max_tokens,
               'messages':[{'role':'system','content':system},{'role':'user','content':user_msg}]},
         timeout=30)
-    if r.status_code!=200: return ''
+    if r.status_code!=200:
+        log(DB,f'OpenRouter FAIL model={model} status={r.status_code} body={r.text[:200]}','ERROR')
+        return ''
     choices=r.json().get('choices',[])
     return choices[0]['message']['content'].strip() if choices else ''
+def _openrouter_healthcheck():
+    """Verify OpenRouter connectivity at startup. Logs result."""
+    if not OPENROUTER_KEY:
+        log(DB,'OPENROUTER: key NOT found — will fallback to direct Anthropic','WARN')
+        return False
+    try:
+        r=requests.get('https://openrouter.ai/api/v1/models',
+            headers={'Authorization':f'Bearer {OPENROUTER_KEY}'},timeout=10)
+        if r.status_code==200:
+            models=r.json().get('data',[])
+            log(DB,f'OPENROUTER: CONNECTED — {len(models)} models available, key=...{OPENROUTER_KEY[-6:]}','MILESTONE')
+            return True
+        log(DB,f'OPENROUTER: auth failed status={r.status_code}','ERROR')
+        return False
+    except Exception as e:
+        log(DB,f'OPENROUTER: connection error: {e}','ERROR')
+        return False
 def advise(obs,gate,rl,cid):
     """ADVISE step: fan out to multiple LLMs via OpenRouter for diverse strategic recommendations."""
     if not ok_budget(): return ''
@@ -183,6 +202,7 @@ def advise(obs,gate,rl,cid):
                         (datetime.now(timezone.utc).isoformat(),cid,'INFO',f'advisor-{label}',r[:2000]))
             except Exception as e:
                 log(DB,f'[{cid}] advisor-{label} error:{e}','WARN',cid=cid)
+    if recs: log(DB,f'[{cid}] ADVISE: {len(recs)}/{len(ADVISOR_MODELS)} models responded via OpenRouter','MILESTONE',cid=cid)
     # Fallback to direct Anthropic if OpenRouter unavailable or as additional signal
     if not recs:
         try:
@@ -297,6 +317,7 @@ def main():
     log(DB,'KARPATHY KAPITAL - FULL AUTONOMY v6 - ASCII FIX + RETRY','MILESTONE')
     log(DB,f'4 agents | 2-min cycles | 22 verified files | doctor | wiki | $50/day','MILESTONE')
     log(DB,'='*55,'MILESTONE')
+    _openrouter_healthcheck()
     if wiki: wiki.log_decision('v6: ASCII fix + JSON retry logic','UTF-8 encoding bug caused all orient calls to fail')
     last_change=0; cycle=0; last_wiki=0
     while True:
