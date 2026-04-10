@@ -336,6 +336,25 @@ def sub_agent(aid,obs,gate,rl,q):
         new=decide(rec,advisor_rec)
         if new: q.put((rec,new,cid,rec.get('priority','medium')))
     except Exception as e: log(DB,f'[{cid}] sub_agent error:{e}','ERROR',cid=cid)
+def _ensure_workers():
+    """Start trading brain, support workers, and dashboard as background processes if not running."""
+    procs=[]
+    checks=[
+        ('trading_brain','BRAIN_TRADE_ENABLED=true python -u workers/trading_brain.py'),
+        ('run_all','python -u workers/run_all.py'),
+        ('dashboard','python -u dashboard.py'),
+    ]
+    for name,cmd in checks:
+        r=subprocess.run(['pgrep','-f',name],capture_output=True)
+        if r.returncode!=0:
+            log(DB,f'Starting {name} in background','MILESTONE')
+            p=subprocess.Popen(cmd,shell=True,cwd='/home/jovyan/workspace/prediction-agent',
+                stdout=open(f'/tmp/{name}.log','a'),stderr=subprocess.STDOUT)
+            procs.append((name,p.pid))
+            log(DB,f'{name} started pid={p.pid}','MILESTONE')
+        else:
+            log(DB,f'{name} already running','INFO')
+    return procs
 def main():
     global N_AGENTS
     init_db()
@@ -344,6 +363,7 @@ def main():
     log(DB,f'4 agents | 2-min cycles | 22 verified files | doctor | wiki | $50/day','MILESTONE')
     log(DB,'='*55,'MILESTONE')
     _openrouter_healthcheck()
+    _ensure_workers()
     if wiki: wiki.log_decision('v6: ASCII fix + JSON retry logic','UTF-8 encoding bug caused all orient calls to fail')
     last_change=0; cycle=0; last_wiki=0
     while True:

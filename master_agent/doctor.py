@@ -108,9 +108,25 @@ def apply_fix(name,rtype,rid,diag,cid):
     result=api('post',f'/api/{rtype}s/{rid}/start')
     log(f'Restarted {name}: {result.get("status","?")}','MILESTONE',cid)
 
+def _check_local_processes(cid):
+    """Ensure trading brain and workers are running locally. Restart if dead."""
+    import subprocess as sp
+    healed=[]
+    checks=[
+        ('trading_brain','BRAIN_TRADE_ENABLED=true python -u workers/trading_brain.py'),
+        ('run_all','python -u workers/run_all.py'),
+    ]
+    for name,cmd in checks:
+        r=sp.run(['pgrep','-f',name],capture_output=True)
+        if r.returncode!=0:
+            log(f'LOCAL PROCESS DOWN: {name} — restarting','MILESTONE',cid)
+            sp.Popen(cmd,shell=True,cwd='/home/jovyan/workspace/prediction-agent',
+                stdout=open(f'/tmp/{name}.log','a'),stderr=sp.STDOUT)
+            healed.append(f'local:{name}')
+    return healed
 def check_and_heal(cid):
     """Main health check. Called from master agent every OODA cycle."""
-    healed=[]
+    healed=_check_local_processes(cid)
     for name,rid in WATCHED['deployments'].items():
         # Skip healing self (master-agent) to avoid restart loops
         if name=='master-agent': continue
