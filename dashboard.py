@@ -865,12 +865,14 @@ function loadLive(){{
       }}
       // Portfolio summary
       const p=d.portfolio||{{}};
-      const pc=p.net_pnl>=0?'#00ff88':'#ff4444';
+      const netpnl=p.net_pnl||p.realized_pnl||0;
+      const pc=netpnl>=0?'#00ff88':'#ff4444';
       let html=`<div style="padding:10px;border-bottom:1px solid #1a1a2e;display:flex;gap:16px;flex-wrap:wrap;font-size:13px">
         <span style="color:#fff;font-weight:700">BAL $${{Number(d.balance||0).toLocaleString()}}</span>
         <span>EXP $${{(p.total_exposure||0).toFixed(0)}}</span>
-        <span style="color:${{pc}};font-weight:700">NET $${{(p.net_pnl||0)>=0?'+':''}}$${{(p.net_pnl||0).toFixed(0)}}</span>
-        <span style="color:#888">${{p.n_positions||0}} positions</span>
+        <span style="color:${{pc}};font-weight:700">P&L $${{netpnl>=0?'+':''}}$${{netpnl.toFixed(0)}}</span>
+        <span style="color:#888">${{p.n_positions||0}} pos</span>
+        <span style="color:#888">${{d.opportunities||0}} edges</span>
       </div>`;
       // Positions by series
       if(p.by_series){{
