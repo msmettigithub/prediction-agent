@@ -289,6 +289,15 @@ async def api_trade(req:Request):
                 db.close()
                 return JSONResponse(analysis)
             cost=round(shares*price_dollars,2)
+            # Risk check BEFORE guard
+            from model.risk import RiskManager
+            risk_mgr=RiskManager(config,trader,db)
+            risk_ok,risk_reason=risk_mgr.check_all()
+            if not risk_ok:
+                analysis['action']='RISK_BLOCKED'
+                analysis['reason']=f'Risk: {risk_reason}'
+                db.close()
+                return JSONResponse(analysis)
             guard_result=guard.check_all(proposed_cost=cost)
             if not guard_result.ok:
                 analysis['action']='BLOCKED'

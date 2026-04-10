@@ -7,6 +7,7 @@ import time, subprocess, sys, os
 from datetime import datetime, timezone
 
 WORKERS = [
+    {'name': 'reconciler', 'cmd': [sys.executable, 'workers/reconciler.py'], 'interval': 900},
     {'name': 'resolver', 'cmd': [sys.executable, 'workers/resolver.py'], 'interval': 900},
     {'name': 'calibrator', 'cmd': [sys.executable, 'workers/calibrator.py'], 'interval': 1800},
     {'name': 'scanner', 'cmd': [sys.executable, 'workers/scanner_worker.py'], 'interval': 1800},
