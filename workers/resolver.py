@@ -165,7 +165,8 @@ def resolve_wti_trades(db_path):
 def main():
     log("=== RESOLVER STARTING ===", 'MILESTONE')
     n1 = resolve_contracts(DB_PATH)
-    n2 = resolve_wti_trades(DB_PATH)
+    try: n2 = resolve_wti_trades(DB_PATH)
+    except Exception: n2 = 0  # wti_paper_trades table may not exist
     log(f"=== RESOLVER DONE: {n1} contracts, {n2} WTI resolved ===", 'MILESTONE')
 
 

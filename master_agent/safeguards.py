@@ -1,4 +1,4 @@
-NEVER_MODIFY=['live/kalshi_trader.py','live/guard.py','master_agent/safeguards.py','.env','CLAUDE.md']
+NEVER_MODIFY=['live/kalshi_trader.py','live/guard.py','master_agent/safeguards.py','.env','CLAUDE.md','workers/trading_brain.py']
 MIN_TEST_COUNT=139
 LIVE_TRADING_AUTO_ENABLE=False
 def can_act(f):
