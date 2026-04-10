@@ -877,8 +877,9 @@ function loadLive(){{
       // Positions by series
       if(p.by_series){{
         html+=Object.entries(p.by_series).map(([s,v])=>{{
-          const uc=v.unrealized>=0?'#00ff88':'#ff4444';
-          return `<div style="padding:4px 10px;display:flex;justify-content:space-between;border-bottom:1px solid #0f0f1a"><span style="color:var(--accent);font-size:12px;font-weight:600">${{s}}</span><span style="font-size:12px"><span style="color:#888">exp=$${{v.exposure.toFixed(0)}}</span> <span style="color:${{uc}};font-weight:600">$${{v.unrealized>=0?'+':''}}$${{v.unrealized.toFixed(0)}}</span> <span style="color:#555">${{v.count}}pos</span></span></div>`;
+          const vunr=v.unrealized||0; const uc=vunr>=0?'#00ff88':'#888';
+          const vexp=v.exposure||v.exp||0; const vn=v.count||v.n||0;
+          return `<div style="padding:4px 10px;display:flex;justify-content:space-between;border-bottom:1px solid #0f0f1a"><span style="color:var(--accent);font-size:12px;font-weight:600">${{s}}</span><span style="font-size:12px"><span style="color:#888">exp=$${{vexp.toFixed(0)}}</span> <span style="color:${{uc}};font-weight:600">${{vn}}pos</span></span></div>`;
         }}).join('');
       }}
       // Alerts
@@ -889,11 +890,19 @@ function loadLive(){{
         }}).join('');
       }}
       // Top positions
-      if(d.positions&&d.positions.length){{
-        html+=`<div style="padding:8px 10px;color:#888;font-size:11px;font-weight:700;border-bottom:1px solid #1a1a2e">POSITIONS (by exposure)</div>`;
+      // Hold reports — evaluated positions with P&L
+      const hr=d.hold_reports||[];
+      if(hr.length){{
+        html+=`<div style="padding:8px 10px;color:#888;font-size:11px;font-weight:700;border-bottom:1px solid #1a1a2e">POSITIONS (${{hr.length}} evaluated)</div>`;
+        html+=hr.map(h=>{{
+          const rc=h.realizable>=0?'#00ff88':'#ff4444';
+          const wp=Math.round((h.win_prob||0)*100);
+          return `<div style="padding:3px 10px;border-bottom:1px solid #0a0a12;font-size:11px"><span style="color:${{h.side==='yes'?'#00ff88':'#ff4444'}};font-weight:600">${{h.side.toUpperCase()}}</span> <span style="color:#ccc">${{h.ticker}}</span> <span style="color:#888">${{h.shares}}sh entry=${{h.entry.toFixed(2)}}</span> <span style="color:${{rc}};font-weight:600">$${{h.realizable>=0?'+':''}}${{h.realizable.toFixed(2)}}</span> <span style="color:#555">win=${{wp}}% ev=$${{h.ev.toFixed(2)}}</span></div>`;
+        }}).join('');
+      }} else if(d.positions&&d.positions.length){{
+        html+=`<div style="padding:8px 10px;color:#888;font-size:11px;font-weight:700;border-bottom:1px solid #1a1a2e">POSITIONS (${{d.positions.length}})</div>`;
         html+=d.positions.slice(0,15).map(p=>{{
-          const uc=p.total_pnl>=0?'#00ff88':'#ff4444';
-          return `<div style="padding:3px 10px;border-bottom:1px solid #0a0a12;font-size:11px"><span style="color:${{p.side==='LONG'?'#00ff88':'#ff4444'}};font-weight:600">${{p.side}}</span> <span style="color:#ccc">${{p.ticker}}</span> <span style="color:#888">${{p.shares}}sh exp=$${{p.exposure}}</span> <span style="color:${{uc}};font-weight:600">$${{p.total_pnl>=0?'+':''}}$${{p.total_pnl}}</span> <span style="color:#555">spot=$${{Number(p.spot).toLocaleString()}} fair=${{(p.fair*100).toFixed(0)}}c</span></div>`;
+          return `<div style="padding:3px 10px;border-bottom:1px solid #0a0a12;font-size:11px"><span style="color:${{p.side==='LONG'?'#00ff88':'#ff4444'}};font-weight:600">${{p.side}}</span> <span style="color:#ccc">${{p.ticker}}</span> <span style="color:#888">${{p.shares}}sh exp=$${{p.exposure}}</span></div>`;
         }}).join('');
       }}
       el.innerHTML=html||'<div style="color:#333;padding:20px">Waiting for monitor data...</div>';
