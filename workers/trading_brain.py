@@ -382,6 +382,8 @@ def main():
     last_order_check = 0
     last_balance_check = 0
     last_db_log = 0
+    last_portfolio_review = 0
+    last_code_review = 0
     balance = 0
     cached_markets = {}
     existing_tickers = set()
@@ -468,7 +470,23 @@ def main():
             # Enable by setting BRAIN_TRADE_ENABLED=true in environment.
             brain_enabled = os.environ.get('BRAIN_TRADE_ENABLED', 'false').lower() == 'true'
             if entries and brain_enabled:
+                from model.llm_reviewer import review_trade
                 for e in entries:
+                    # LLM sanity check before execution
+                    view = series_intel.get(e.get('series', ''))
+                    review = review_trade(
+                        ticker=e['ticker'], side=e['side'], shares=e['shares'], price=e['price'],
+                        spot_price=e['spot'], strike=e['strike'], hours_to_expiry=e.get('hours', 16),
+                        edge=e['edge'], win_probability=e.get('fair_yes', 0.5) if e['side']=='yes' else 1-e.get('fair_yes', 0.5),
+                        expected_pnl=e.get('expected_profit', 0),
+                        intel_direction=view.direction if view else 0,
+                        intel_signals=[s.source for s in view.signals] if view else [],
+                    )
+                    if not review.approved:
+                        log(f"LLM REJECTED: {e['ticker']} — {review.reasoning} "
+                            f"risks={review.risks} ({review.model} {review.latency_ms}ms)", 'WARN')
+                        continue
+
                     price_cents = max(1, min(99, int(round(e['price'] * 100))))
                     try:
                         order = place_order(trader, e['ticker'], e['side'], e['shares'], price_cents)
@@ -478,7 +496,7 @@ def main():
                                 f"edge={e['edge']:+.0%} EV=${e.get('expected_profit',0):+.2f} "
                                 f"win=${fc.get('profit_if_win',0):+.2f} lose=${fc.get('loss_if_lose',0):.2f} "
                                 f"r:r={fc.get('risk_reward',0):.1f} breakeven={fc.get('breakeven_prob',0):.0%} "
-                                f"| {oid}", 'MILESTONE')
+                                f"LLM={review.confidence:.0%} | {oid}", 'MILESTONE')
                         total_entered += 1
                         existing_tickers.add(e['ticker'])
                     except Exception as ex:
@@ -638,6 +656,30 @@ def main():
                   f"{elapsed:.0f}ms C#{cycle} {spot_line} bal=${balance:.0f} "
                   f"exp=${total_exp:.0f} pnl=${total_pnl:+.0f} "
                   f"pos={len(positions)}{action_line}")
+
+            # LLM portfolio review every 15 min
+            if time.time() - last_portfolio_review > 900:
+                try:
+                    from model.llm_reviewer import review_portfolio
+                    hr = [{'side':h.side,'ticker':h.ticker,'shares':h.shares,'entry':h.entry_price,
+                           'fair':h.current_fair,'ev':h.expected_pnl} for h in hold_reports]
+                    intel_dict = {name: {'dir': v.direction, 'conv': v.conviction, 'vol': v.vol_regime}
+                                 for name, v in intel.items()} if intel else {}
+                    advice = review_portfolio(hr, balance, total_exp, total_pnl, intel_dict)
+                    if advice:
+                        log(f"PORTFOLIO REVIEW: {advice[:400]}", 'MILESTONE')
+                    last_portfolio_review = time.time()
+                except: pass
+
+            # LLM code health review every hour
+            if time.time() - last_code_review > 3600:
+                try:
+                    from model.llm_reviewer import review_code_health
+                    health = review_code_health()
+                    if health:
+                        log(f"CODE REVIEW: {health[:400]}", 'MILESTONE')
+                    last_code_review = time.time()
+                except: pass
 
             # DB log every 60s
             if time.time() - last_db_log > 60:
