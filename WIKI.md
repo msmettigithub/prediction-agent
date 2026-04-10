@@ -192,3 +192,42 @@ Last update: 2026-04-10 16:36 UTC
 - pnl: 0
 - rl_rate: 0.0
 - cost: $134.01
+
+
+## Session Log
+- 2026-04-10 17:35: SESSION 2026-04-10: Major architecture rebuild.
+BALANCE: $3,378 (started $1,710, dipped to $1,362, recovered via settlements).
+NET REALIZED: -$85 (down from -$275 after WTI/BTC settlements paid out).
+
+WHAT WAS BUILT:
+- model/data_modifiers.py: real data → probability modifiers (Yahoo vol, BLS CPI/GDP, Deribit IV)
+- model/market_intel.py: aggregates 6 feeds into per-asset direction+conviction+vol regime
+- model/trade_pnl.py: P&L forecast at entry/hold/exit (cost, fees, EV, breakeven, risk/reward)
+- model/risk.py: drawdown circuit breaker ($50/day loss, 80% exposure, 40% concentration)
+- model/llm_reviewer.py: Claude reviews every trade, generates ideas, audits portfolio+code
+- workers/trading_brain.py: unified observe/decide/act loop (2s cycles, 18K+ cycles today)
+- workers/market_maker.py: quotes both sides near-the-money (disabled — no fills)
+- workers/reconciler.py: syncs Kalshi positions to local DB
+- workers/fill_tracker.py: catches fills, cancels stale orders
+- workers/auto_trader.py: NO-on-cheap-YES strategy (97% backtest win rate)
+- workers/live_monitor.py: replaced by trading_brain.py
+- master_agent/auditor.py: 8 checks, auto-restarts brain+dashboard
+- Dashboard: Live tab (intel+ideas+positions), Arch tab (live architecture), chat trades, search
+
+CRITICAL FIXES:
+- Old probability model used fake 0.60 base rate → replaced with market price + real data
+- Brain sold winning BTC/Gold positions → exit logic rebuilt (only take-profit, no stop-loss on binaries)
+- CPI/GDP had no data → now using BLS API (no key needed)
+- Backtest proved: buying cheap YES loses money, selling cheap YES (buying NO) = 97% win rate
+
+WHAT'S RUNNING:
+- trading_brain.py: 2s cycles, monitors all positions, generates ideas via Claude every 5min
+- run_all.py: fill_tracker(30s), reconciler(60s), resolver(120s), calibrator(300s)
+- dashboard.py: port 8000
+- Brain trading ENABLED at $7 max bet, every trade goes through LLM review
+
+KNOWN ISSUES:
+- Vol model miscalibrated for multi-day contracts (Claude correctly rejects these)
+- Market maker had zero fills — disabled
+- OpenRouter API key not found in environment — only Claude available for LLM review
+- .env has LIVE_TRADING_ENABLED=true with $1000/$200 limits (should be lower)
