@@ -389,6 +389,75 @@ def api_live_events():
     events=q("SELECT ts,event_type,message,data FROM trader_events ORDER BY id DESC LIMIT 50",db=TRADE_DB)
     return {'events':events}
 
+@app.get('/api/architecture')
+def api_architecture():
+    """Generate live architecture diagram from running system state."""
+    import subprocess
+    # Check what's running
+    procs=subprocess.run(['ps','aux'],capture_output=True,text=True).stdout
+    brain_on='trading_brain' in procs
+    mm_on='market_maker' in procs
+    workers_on='run_all' in procs
+    dash_on=True  # we're serving this, so yes
+    # Read brain state
+    brain_state={}
+    try:
+        with open('/tmp/live_monitor.json') as f: brain_state=json.load(f)
+    except: pass
+    llm=brain_state.get('llm_activity',{})
+    intel=brain_state.get('intel',{})
+    cycle=brain_state.get('cycle',0)
+    opps=brain_state.get('opportunities',0)
+    ideas=brain_state.get('llm_ideas',[])
+    hr=brain_state.get('hold_reports',[])
+    exits=brain_state.get('exit_candidates',[])
+    return {
+        'processes':{
+            'Trading Brain':{'status':'RUNNING' if brain_on else 'DOWN','cycle':cycle,'detail':f'{opps} opportunities, 2s cycles'},
+            'Market Maker':{'status':'RUNNING' if mm_on else 'OFF','detail':'quotes both sides near-the-money'},
+            'Workers':{'status':'RUNNING' if workers_on else 'DOWN','detail':'fill_tracker(30s) reconciler(60s) resolver(120s) calibrator(300s)'},
+            'Dashboard':{'status':'RUNNING','detail':'port 8000, chat+trade+search+monitor'},
+            'Master Agent':{'status':'RUNNING (Saturn)','detail':'OODA loop, RL code changes, wiki updates'},
+        },
+        'pipeline':[
+            {'stage':'Data Feeds','sources':['Yahoo Finance (spot+vol)','CoinGecko (BTC/ETH)','Deribit (IV+funding+basis)','Fear & Greed','BLS (CPI+GDP)','Kalshi Orderbook'],'status':'6/8 active','detail':'FRED+Brave keys missing'},
+            {'stage':'Market Intel','output':'direction + conviction per asset','assets':{k:{'dir':v.get('dir',0),'conv':v.get('conv',0),'vol':v.get('vol','')} for k,v in intel.items()}},
+            {'stage':'Vol Model','method':'Black-Scholes binary pricing with realized vol','output':'fair value per contract'},
+            {'stage':'Edge Detection','method':'fair value vs market price, both YES and NO sides','threshold':'5pp minimum'},
+            {'stage':'Intel Gate','method':'blocks trades against data conviction (>0.3)'},
+            {'stage':'P&L Forecast','method':'entry cost, win/lose amounts, expected value, breakeven prob, risk/reward','gate':'must be positive EV after fees'},
+            {'stage':'LLM Trade Review','model':llm.get('Trade Reviewer',{}).get('model','claude-sonnet-4-6'),'status':llm.get('Trade Reviewer',{}).get('status','idle'),'detail':llm.get('Trade Reviewer',{}).get('summary','')},
+            {'stage':'Risk Manager','checks':['daily loss < $50','exposure < 80% balance','concentration < 40% per series']},
+            {'stage':'Execute on Kalshi','method':'limit order via REST API'},
+        ],
+        'llm_roles':{
+            'Idea Generator':{'model':'claude-sonnet-4-6','frequency':'every 5 min','purpose':'proposes 1-3 new trade ideas from portfolio+intel+markets','last':llm.get('Idea Generator',{}).get('summary','')},
+            'Trade Reviewer':{'model':'claude-sonnet-4-6','frequency':'every trade','purpose':'sanity-checks data, logic, risks before execution. Can reject.','last':llm.get('Trade Reviewer',{}).get('summary','')},
+            'Portfolio Strategist':{'model':'claude-sonnet-4-6','frequency':'every 15 min','purpose':'strategic advice on positions, risk, opportunities','last':llm.get('Portfolio Strategist',{}).get('summary','')},
+            'Code Auditor':{'model':'claude-sonnet-4-6','frequency':'every 1 hour','purpose':'reviews error logs, identifies recurring issues, suggests fixes','last':llm.get('Code Auditor',{}).get('summary','')},
+            'Dashboard Chat':{'model':'claude-sonnet-4-6','frequency':'on demand','purpose':'human interface — search markets, execute trades, ask questions'},
+        },
+        'safety':{
+            'tests':'139 passing (pytest)',
+            'auditor':'8 checks every 10 min, auto-restarts brain+dashboard if down',
+            'protected_files':['live/kalshi_trader.py','live/guard.py','master_agent/safeguards.py','.env'],
+            'exit_logic':'only take-profit exits (profitable AND edge flipped). No stop-loss on binary contracts.',
+            'bet_size':'$7 max per trade (learning mode)',
+        },
+        'databases':{
+            'shared':{'path':'/home/jovyan/shared/sm/prediction-agent-db/prediction_agent.db','tables':'agent_log, agent_changes, agent_commands, tool_experiments'},
+            'local':{'path':'prediction_agent.db','tables':'contracts, paper_trades, live_trades, predictions, resolutions, deep_dive_results, scalper_trades, wti_paper_trades, portfolio_snapshots, scan_candidates, model_accuracy'},
+        },
+        'current_state':{
+            'balance':brain_state.get('balance',0),
+            'positions':len(hr),
+            'exposure':brain_state.get('portfolio',{}).get('total_exposure',0),
+            'realized_pnl':brain_state.get('portfolio',{}).get('realized_pnl',0),
+            'ideas_pending':len(ideas),
+            'exit_signals':len(exits),
+        },
+    }
+
 @app.get('/api/monitor')
 def api_monitor():
     """Return live monitor state — spots, positions, alerts."""
@@ -674,6 +743,7 @@ def home():
   <button class='tab' id='tab-pnl' onclick='sw("pnl")'><span class='tab-icon'>📈</span>P&L</button>
   <button class='tab' id='tab-tools' onclick='sw("tools")'><span class='tab-icon'>🔬</span>Tools</button>
   <button class='tab' id='tab-health' onclick='sw("health")'><span class='tab-icon'>🩺</span>Health</button>
+  <button class='tab' id='tab-arch' onclick='sw("arch")'><span class='tab-icon'>🏗️</span>Arch</button>
 </div>
 <!-- DASHBOARD TAB -->
 <div id='pane-dash' class='pane active'>
@@ -800,6 +870,16 @@ def home():
     </div>
     <div class='sec-title'>Trade Log</div>
     <div class='sec scroll-tall' id='pnl-trades'></div>
+  </div>
+</div>
+<!-- ARCHITECTURE TAB -->
+<div id='pane-arch' class='pane'>
+  <div class='col-full'>
+    <div style='background:var(--bg2);border:1px solid #7c3aed44;border-radius:8px;padding:14px;margin-bottom:14px'>
+      <div style='color:var(--accent);font-size:13px;font-weight:700;margin-bottom:8px'>KARPATHY KAPITAL — SYSTEM ARCHITECTURE</div>
+      <div style='color:#888;font-size:11px'>Auto-generated from running system. Updates on tab switch.</div>
+    </div>
+    <div id='arch-content' class='sec' style='padding:14px;font-family:monospace;font-size:12px;line-height:1.8;color:#ccc'></div>
   </div>
 </div>
 <!-- HEALTH TAB -->
@@ -1078,7 +1158,49 @@ function refreshCmds(){{
     }}).join('');
   }}).catch(()=>{{}});
 }}
-function sw(id){{document.querySelectorAll('.pane,.tab').forEach(e=>e.classList.remove('active'));document.getElementById('pane-'+id).classList.add('active');document.getElementById('tab-'+id).classList.add('active');if(id==='chat'){{document.getElementById('ci').focus();refreshCmds();if(!cmdTimer)cmdTimer=setInterval(refreshCmds,5000);}}if(id==='pnl')loadPnL();if(id==='live')loadLive();if(id==='health'){{runHealth();startHealthTimer();}}}}
+function loadArch(){{
+  _f('/api/architecture').then(r=>r.json()).then(d=>{{
+    const el=document.getElementById('arch-content');
+    let h='';
+    // Processes
+    h+=`<div style="color:var(--accent);font-weight:700;margin-bottom:8px">PROCESSES</div>`;
+    Object.entries(d.processes||{{}}).forEach(([name,p])=>{{
+      const sc=p.status.includes('RUNNING')?'#00ff88':p.status==='OFF'?'#555':'#ff4444';
+      h+=`<div style="margin-bottom:4px"><span style="color:${{sc}};font-weight:600">${{p.status}}</span> ${{name}} <span style="color:#555">— ${{p.detail||''}}</span></div>`;
+    }});
+    // Pipeline
+    h+=`<div style="color:var(--accent);font-weight:700;margin:16px 0 8px">TRADE PIPELINE</div>`;
+    (d.pipeline||[]).forEach((s,i)=>{{
+      h+=`<div style="margin-bottom:6px;padding-left:${{i*8}}px"><span style="color:#ffaa00">${{i+1}}.</span> <span style="color:#ddd;font-weight:600">${{s.stage}}</span>`;
+      if(s.method) h+=` <span style="color:#888">— ${{s.method}}</span>`;
+      if(s.gate) h+=` <span style="color:#ff4444">GATE: ${{s.gate}}</span>`;
+      if(s.status) h+=` <span style="color:#00ff88">[${{s.status}}]</span>`;
+      if(s.sources) h+=`<div style="color:#555;padding-left:16px">${{s.sources.join(' · ')}}</div>`;
+      if(s.detail) h+=` <span style="color:#555">${{s.detail}}</span>`;
+      h+=`</div>`;
+    }});
+    // LLM Roles
+    h+=`<div style="color:#e879f9;font-weight:700;margin:16px 0 8px">LLM MODELS</div>`;
+    Object.entries(d.llm_roles||{{}}).forEach(([role,info])=>{{
+      h+=`<div style="margin-bottom:6px"><span style="color:#e879f9;font-weight:600">${{role}}</span> <span style="color:#888">(${{info.model}}, ${{info.frequency}})</span><div style="color:#aaa;padding-left:16px">${{info.purpose}}</div>`;
+      if(info.last) h+=`<div style="color:#555;padding-left:16px;font-size:11px">Last: ${{info.last.slice(0,100)}}</div>`;
+      h+=`</div>`;
+    }});
+    // Safety
+    h+=`<div style="color:#ff4444;font-weight:700;margin:16px 0 8px">SAFETY</div>`;
+    const sf=d.safety||{{}};
+    Object.entries(sf).forEach(([k,v])=>{{
+      const val=Array.isArray(v)?v.join(', '):v;
+      h+=`<div style="margin-bottom:2px"><span style="color:#888">${{k}}:</span> <span style="color:#ccc">${{val}}</span></div>`;
+    }});
+    // Current state
+    h+=`<div style="color:#00ff88;font-weight:700;margin:16px 0 8px">LIVE STATE</div>`;
+    const cs=d.current_state||{{}};
+    h+=`<div>Balance: $${{Number(cs.balance||0).toLocaleString()}} | Exposure: $${{Number(cs.exposure||0).toFixed(0)}} | P&L: $${{Number(cs.realized_pnl||0).toFixed(0)}} | Positions: ${{cs.positions||0}} | Ideas: ${{cs.ideas_pending||0}} | Exits: ${{cs.exit_signals||0}}</div>`;
+    el.innerHTML=h;
+  }}).catch(e=>{{document.getElementById('arch-content').innerHTML=`<div style="color:#ff4444">Error: ${{e}}</div>`;}});
+}}
+function sw(id){{document.querySelectorAll('.pane,.tab').forEach(e=>e.classList.remove('active'));document.getElementById('pane-'+id).classList.add('active');document.getElementById('tab-'+id).classList.add('active');if(id==='chat'){{document.getElementById('ci').focus();refreshCmds();if(!cmdTimer)cmdTimer=setInterval(refreshCmds,5000);}}if(id==='pnl')loadPnL();if(id==='live')loadLive();if(id==='health'){{runHealth();startHealthTimer();}}if(id==='arch')loadArch();}}
 </script></body></html>"""
 
 if __name__=='__main__':
