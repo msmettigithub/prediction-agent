@@ -12,6 +12,7 @@ Every 5 min:
 - Checks risk limits
 """
 import os, sys, json, time, sqlite3, math
+import concurrent.futures
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -201,36 +202,62 @@ def scan_opportunities(spots, trader):
     return sorted(alerts, key=lambda x: -x['edge'])
 
 
+def _fetch_all_spots():
+    """Fetch all spot prices in parallel. ~200ms total."""
+    spots = {}
+    symbols = list(SPOT_SYMBOLS.items())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(symbols)) as ex:
+        futures = {ex.submit(fetch_spot, sym): series for series, sym in symbols}
+        for f in concurrent.futures.as_completed(futures):
+            series = futures[f]
+            try:
+                spots[series] = f.result()
+            except:
+                pass
+    return spots
+
+
 def main():
-    log("=== LIVE MONITOR STARTING ===", 'MILESTONE')
+    log("=== LIVE MONITOR STARTING (fast loop) ===", 'MILESTONE')
     config = load_config()
     trader = KalshiTrader(config)
 
     cycle = 0
+    last_scan = 0
+    last_db_log = 0
+    last_balance_check = 0
+    balance = 0
+    alerts = []
+
     while True:
         cycle += 1
+        t_start = time.time()
         try:
-            # Fetch spot prices
-            spots = {}
-            for series, symbol in SPOT_SYMBOLS.items():
-                try:
-                    spots[series] = fetch_spot(symbol)
-                except Exception as e:
-                    pass
+            # 1. Parallel: spots + positions (~200ms)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+                spots_future = ex.submit(_fetch_all_spots)
+                pos_future = ex.submit(fetch_positions, trader)
+                # Balance check every 10 cycles (~30s) to avoid rate limits
+                bal_future = None
+                if time.time() - last_balance_check > 30:
+                    bal_future = ex.submit(trader.get_balance)
 
-            spot_line = ' | '.join(f'{s}=${spots[s].price:,.2f}' for s in sorted(spots))
+                spots = spots_future.result()
+                positions = pos_future.result()
+                if bal_future:
+                    try:
+                        balance = bal_future.result()
+                        last_balance_check = time.time()
+                    except:
+                        pass
 
-            # Fetch positions
-            positions = fetch_positions(trader)
-
-            # Mark to market
+            # 2. Mark to market (pure computation, <1ms)
             mtm = compute_mtm(positions, spots)
             total_unreal = sum(p['unrealized'] for p in mtm)
             total_real = sum(p['realized'] for p in mtm)
             total_fees = sum(p['fees'] for p in mtm)
             total_exp = sum(p['exposure'] for p in mtm)
 
-            # Group by series for summary
             from collections import defaultdict
             by_series = defaultdict(lambda: {'unrealized': 0, 'exposure': 0, 'count': 0})
             for p in mtm:
@@ -238,16 +265,12 @@ def main():
                 by_series[p['series']]['exposure'] += p['exposure']
                 by_series[p['series']]['count'] += 1
 
-            series_line = ' | '.join(
-                f'{s}:${d["unrealized"]:+.0f}' for s, d in sorted(by_series.items()))
-
-            # Scan for opportunities every other cycle
-            alerts = []
-            if cycle % 2 == 0:
+            # 3. Scan for edges every 15s (adds ~500ms from Kalshi event API)
+            if time.time() - last_scan > 15:
                 alerts = scan_opportunities(spots, trader)
+                last_scan = time.time()
 
-            # Build state
-            balance = trader.get_balance()
+            # 4. Write state (<1ms)
             state = {
                 'ts': datetime.now(timezone.utc).isoformat(),
                 'cycle': cycle,
@@ -263,39 +286,44 @@ def main():
                     'n_positions': len(mtm),
                     'by_series': {s: dict(d) for s, d in by_series.items()},
                 },
-                'positions': mtm[:20],  # top 20 by exposure
+                'positions': sorted(mtm, key=lambda x: -x['exposure'])[:20],
                 'alerts': alerts[:10],
             }
-
-            # Write state files
             with open(STATE_FILE, 'w') as f:
                 json.dump(state, f)
             if alerts:
                 with open(ALERT_FILE, 'w') as f:
                     json.dump({'ts': state['ts'], 'alerts': alerts}, f)
 
-            # Log
-            status = (f"C#{cycle} {spot_line} | bal=${balance:.0f} exp=${total_exp:.0f} "
-                      f"unreal=${total_unreal:+.0f} real=${total_real:+.0f} fees=${total_fees:.0f} "
-                      f"net=${total_unreal + total_real - total_fees:+.0f} | {series_line}")
-            if alerts:
-                status += f" | {len(alerts)} edges: {alerts[0]['ticker']} {alerts[0]['side']} {alerts[0]['edge']:+.0%}"
+            elapsed = (time.time() - t_start) * 1000
+            spot_line = ' '.join(f'{s}={spots[s].price:,.0f}' for s in sorted(spots))
+            net = total_unreal + total_real - total_fees
+            print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:12]}] "
+                  f"{elapsed:.0f}ms C#{cycle} {spot_line} net=${net:+.0f} "
+                  f"{'edges=' + str(len(alerts)) if alerts else ''}")
 
-            print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {status}")
+            # DB log every 60s
+            if time.time() - last_db_log > 60:
+                series_line = ' '.join(f'{s}:${d["unrealized"]:+.0f}' for s, d in sorted(by_series.items()))
+                log(f"C#{cycle} bal=${balance:.0f} exp=${total_exp:.0f} net=${net:+.0f} | {series_line}")
+                last_db_log = time.time()
 
-            # Log to DB every 5th cycle
-            if cycle % 5 == 0:
-                log(f"STATUS {status}", 'INFO')
-
-            # Alert on big moves
+            # Alert on big unrealized losses
             for p in mtm:
                 if p['unrealized'] < -50:
-                    log(f"ALERT: {p['ticker']} {p['side']} unrealized=${p['unrealized']:+.0f}", 'WARN')
+                    log(f"LOSS ALERT: {p['ticker']} {p['side']} unrealized=${p['unrealized']:+.0f}", 'WARN')
 
         except Exception as e:
             log(f"Monitor error: {e}", 'ERROR')
+            time.sleep(1)  # brief pause only on error
+            continue
 
-        time.sleep(30)
+        # Tight loop: only sleep the remainder to hit target cycle time
+        elapsed = time.time() - t_start
+        target = 3.0  # 3 second cycles — 20 updates/minute
+        remaining = max(0, target - elapsed)
+        if remaining > 0:
+            time.sleep(remaining)
 
 
 if __name__ == '__main__':

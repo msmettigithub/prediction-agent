@@ -846,7 +846,7 @@ function am(role,text){{const m=document.getElementById('msgs');const t=new Date
 async function sc(){{const i=document.getElementById('ci');const msg=i.value.trim();if(!msg)return;am('user',msg);i.value='';i.style.height='auto';H.push({{role:'user',content:msg}});am('ai','...');try{{const r=await _f('/chat',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{message:msg,history:H.slice(0,-1)}})}});const j=await r.json();const bs=document.getElementById('msgs').querySelectorAll('.msg.ai');bs[bs.length-1].querySelector('.msg-bubble').innerHTML=(j.response||'Error').replace(/\\n/g,'<br>');H.push({{role:'assistant',content:j.response||''}});if(j.commands_queued?.length)am('ai','⚡ Queued: '+j.commands_queued.join(', '));if(j.trades?.length){{j.trades.forEach(t=>{{const col=t.action?.includes('TRADE')?'#00ff88':t.action==='DECLINED'?'#ffaa00':'#ff4444';am('ai',`<span style="color:${{col}};font-weight:700">${{t.action}}</span> ${{t.ticker}} ${{t.side||''}} mkt=${{(t.market_price*100).toFixed(0)}}c model=${{(t.model_prob*100).toFixed(0)}}c edge=${{(t.edge*100).toFixed(1)}}pp ${{t.bet_amount?'$'+t.bet_amount:''}} ${{t.reason||''}}`)}})}}if(j.search?.length){{let s='<b>MARKETS FOUND:</b><br>'+j.search.map(m=>`<span style="color:var(--accent)">${{m.ticker}}</span> ${{(m.yes_price*100).toFixed(0)}}c — ${{m.title.slice(0,70)}}`).join('<br>');am('ai',s)}}if(j.scan?.length){{let s='<b>SCAN:</b><br>'+j.scan.map(c=>`${{c.source_id}} ${{c.recommendation}} mkt=${{(c.market_price*100).toFixed(0)}}c edge=${{(c.edge*100).toFixed(1)}}pp`).join('<br>');am('ai',s)}}}}catch(e){{am('ai','Error: '+e);}}}}
 document.getElementById('ci').addEventListener('keydown',e=>{{if(e.key==='Enter'&&!e.shiftKey){{e.preventDefault();sc();}}}});
 async function sendCmd(){{const i=document.getElementById('cmi');const cmd=i.value.trim();const s=document.getElementById('cms');if(!cmd)return;s.textContent='Sending...';s.style.color='#ffaa00';try{{const r=await _f('/command',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{command:cmd}})}});const j=await r.json();if(j.ok){{s.textContent='Queued at '+j.queued_at+' ET';s.style.color='#00ff88';i.value='';}}else s.textContent='Error: '+j.error;}}catch(e){{s.textContent='Error: '+e;s.style.color='#ff4444';}}}}
-setInterval(()=>{{if(document.getElementById('pane-dash').classList.contains('active'))location.reload();}},30000);
+setInterval(()=>{{if(document.getElementById('pane-dash').classList.contains('active'))location.reload();}},10000);
 // Live Monitor Feed
 let liveTimer=null;
 function loadLive(){{
@@ -867,16 +867,16 @@ function loadLive(){{
       const p=d.portfolio||{{}};
       const pc=p.net_pnl>=0?'#00ff88':'#ff4444';
       let html=`<div style="padding:10px;border-bottom:1px solid #1a1a2e;display:flex;gap:16px;flex-wrap:wrap;font-size:13px">
-        <span style="color:#fff;font-weight:700">BAL $${Number(d.balance||0).toLocaleString()}</span>
-        <span>EXP $${(p.total_exposure||0).toFixed(0)}</span>
-        <span style="color:${pc};font-weight:700">NET $${(p.net_pnl||0)>=0?'+':''}}$${(p.net_pnl||0).toFixed(0)}</span>
+        <span style="color:#fff;font-weight:700">BAL $${{Number(d.balance||0).toLocaleString()}}</span>
+        <span>EXP $${{(p.total_exposure||0).toFixed(0)}}</span>
+        <span style="color:${{pc}};font-weight:700">NET $${{(p.net_pnl||0)>=0?'+':''}}$${{(p.net_pnl||0).toFixed(0)}}</span>
         <span style="color:#888">${{p.n_positions||0}} positions</span>
       </div>`;
       // Positions by series
       if(p.by_series){{
         html+=Object.entries(p.by_series).map(([s,v])=>{{
           const uc=v.unrealized>=0?'#00ff88':'#ff4444';
-          return `<div style="padding:4px 10px;display:flex;justify-content:space-between;border-bottom:1px solid #0f0f1a"><span style="color:var(--accent);font-size:12px;font-weight:600">${{s}}</span><span style="font-size:12px"><span style="color:#888">exp=$${v.exposure.toFixed(0)}</span> <span style="color:${{uc}};font-weight:600">$${v.unrealized>=0?'+':''}}$${v.unrealized.toFixed(0)}</span> <span style="color:#555">${{v.count}}pos</span></span></div>`;
+          return `<div style="padding:4px 10px;display:flex;justify-content:space-between;border-bottom:1px solid #0f0f1a"><span style="color:var(--accent);font-size:12px;font-weight:600">${{s}}</span><span style="font-size:12px"><span style="color:#888">exp=$${{v.exposure.toFixed(0)}}</span> <span style="color:${{uc}};font-weight:600">$${{v.unrealized>=0?'+':''}}$${{v.unrealized.toFixed(0)}}</span> <span style="color:#555">${{v.count}}pos</span></span></div>`;
         }}).join('');
       }}
       // Alerts
@@ -891,7 +891,7 @@ function loadLive(){{
         html+=`<div style="padding:8px 10px;color:#888;font-size:11px;font-weight:700;border-bottom:1px solid #1a1a2e">POSITIONS (by exposure)</div>`;
         html+=d.positions.slice(0,15).map(p=>{{
           const uc=p.total_pnl>=0?'#00ff88':'#ff4444';
-          return `<div style="padding:3px 10px;border-bottom:1px solid #0a0a12;font-size:11px"><span style="color:${{p.side==='LONG'?'#00ff88':'#ff4444'}};font-weight:600">${{p.side}}</span> <span style="color:#ccc">${{p.ticker}}</span> <span style="color:#888">${{p.shares}}sh exp=$${p.exposure}</span> <span style="color:${{uc}};font-weight:600">$${p.total_pnl>=0?'+':''}}$${p.total_pnl}</span> <span style="color:#555">spot=$${Number(p.spot).toLocaleString()} fair=${{(p.fair*100).toFixed(0)}}c</span></div>`;
+          return `<div style="padding:3px 10px;border-bottom:1px solid #0a0a12;font-size:11px"><span style="color:${{p.side==='LONG'?'#00ff88':'#ff4444'}};font-weight:600">${{p.side}}</span> <span style="color:#ccc">${{p.ticker}}</span> <span style="color:#888">${{p.shares}}sh exp=$${{p.exposure}}</span> <span style="color:${{uc}};font-weight:600">$${{p.total_pnl>=0?'+':''}}$${{p.total_pnl}}</span> <span style="color:#555">spot=$${{Number(p.spot).toLocaleString()}} fair=${{(p.fair*100).toFixed(0)}}c</span></div>`;
         }}).join('');
       }}
       el.innerHTML=html||'<div style="color:#333;padding:20px">Waiting for monitor data...</div>';
@@ -1005,7 +1005,7 @@ function runHealth(){{
     document.getElementById('health-summary').style.color='#ff4444';
   }});
 }}
-function startHealthTimer(){{if(!healthTimer)healthTimer=setInterval(runHealth,60000);}}
+function startHealthTimer(){{if(!healthTimer)healthTimer=setInterval(runHealth,30000);}}
 // Command queue
 let cmdTimer=null;
 async function queueCmd(cmd){{
@@ -1030,7 +1030,7 @@ function refreshCmds(){{
     }}).join('');
   }}).catch(()=>{{}});
 }}
-function sw(id){{document.querySelectorAll('.pane,.tab').forEach(e=>e.classList.remove('active'));document.getElementById('pane-'+id).classList.add('active');document.getElementById('tab-'+id).classList.add('active');if(id==='chat'){{document.getElementById('ci').focus();refreshCmds();if(!cmdTimer)cmdTimer=setInterval(refreshCmds,10000);}}if(id==='pnl')loadPnL();if(id==='live')loadLive();if(id==='health'){{runHealth();startHealthTimer();}}}}
+function sw(id){{document.querySelectorAll('.pane,.tab').forEach(e=>e.classList.remove('active'));document.getElementById('pane-'+id).classList.add('active');document.getElementById('tab-'+id).classList.add('active');if(id==='chat'){{document.getElementById('ci').focus();refreshCmds();if(!cmdTimer)cmdTimer=setInterval(refreshCmds,5000);}}if(id==='pnl')loadPnL();if(id==='live')loadLive();if(id==='health'){{runHealth();startHealthTimer();}}}}
 </script></body></html>"""
 
 if __name__=='__main__':

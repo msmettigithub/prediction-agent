@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""Run all workers locally in a loop. Use this when Saturn jobs can't be provisioned.
+"""Run all workers locally in a tight loop.
 
-Runs resolver every 15 min, calibrator every 30 min, scanner every 30 min.
+Intervals are minimized:
+- reconciler: 60s (sync positions with Kalshi)
+- fill_tracker: 30s (catch fills, cancel stale orders)
+- resolver: 120s (resolve expired contracts)
+- calibrator: 300s (compute model accuracy — heavier, less frequent)
+- scanner: 120s (scan for new opportunities)
+
+The live_monitor runs separately as its own process (3s cycle).
 """
 import time, subprocess, sys, os
 from datetime import datetime, timezone
 
 WORKERS = [
-    {'name': 'reconciler', 'cmd': [sys.executable, 'workers/reconciler.py'], 'interval': 900},
-    {'name': 'resolver', 'cmd': [sys.executable, 'workers/resolver.py'], 'interval': 900},
-    {'name': 'calibrator', 'cmd': [sys.executable, 'workers/calibrator.py'], 'interval': 1800},
-    {'name': 'scanner', 'cmd': [sys.executable, 'workers/scanner_worker.py'], 'interval': 1800},
+    {'name': 'fill_tracker', 'cmd': [sys.executable, 'workers/fill_tracker.py'], 'interval': 30},
+    {'name': 'reconciler', 'cmd': [sys.executable, 'workers/reconciler.py'], 'interval': 60},
+    {'name': 'resolver', 'cmd': [sys.executable, 'workers/resolver.py'], 'interval': 120},
+    {'name': 'scanner', 'cmd': [sys.executable, 'workers/scanner_worker.py'], 'interval': 120},
+    {'name': 'calibrator', 'cmd': [sys.executable, 'workers/calibrator.py'], 'interval': 300},
 ]
 
 def main():
@@ -23,19 +31,22 @@ def main():
         for w in WORKERS:
             if now - last_run[w['name']] >= w['interval']:
                 ts = datetime.now(timezone.utc).strftime('%H:%M:%S')
-                print(f"\n[{ts}] Running {w['name']}...")
                 try:
-                    r = subprocess.run(w['cmd'], cwd=cwd, timeout=300,
+                    r = subprocess.run(w['cmd'], cwd=cwd, timeout=120,
                                        capture_output=True, text=True)
-                    print(r.stdout[-500:] if r.stdout else '')
+                    # Print last line only for brevity
+                    lines = [l for l in (r.stdout or '').strip().split('\n') if l.strip()]
+                    summary = lines[-1] if lines else ''
+                    print(f"[{ts}] {w['name']:15} {summary[-120:]}")
                     if r.returncode != 0:
-                        print(f"  ERROR: {r.stderr[-300:]}")
+                        err_lines = [l for l in (r.stderr or '').strip().split('\n') if l.strip()]
+                        print(f"  ERR: {err_lines[-1][:120] if err_lines else 'unknown'}")
                 except subprocess.TimeoutExpired:
-                    print(f"  TIMEOUT: {w['name']}")
+                    print(f"[{ts}] {w['name']:15} TIMEOUT")
                 except Exception as e:
-                    print(f"  FAILED: {e}")
+                    print(f"[{ts}] {w['name']:15} FAIL: {e}")
                 last_run[w['name']] = now
-        time.sleep(30)
+        time.sleep(5)  # check every 5s
 
 if __name__ == '__main__':
     main()
