@@ -83,14 +83,27 @@ async def chat(req:Request):
         try:
             feed_line=subprocess.run(['tail','-1','/tmp/smart_trader.log'],capture_output=True,text=True,timeout=2).stdout.strip()
         except: feed_line=''
-        # Add portfolio balance
+        # Add portfolio balance + live positions
         try:
             from config import load_config
             from live.kalshi_trader import KalshiTrader
+            import requests as _rq
             config=load_config()
             trader=KalshiTrader(config)
             balance=trader.get_balance()
             bal_str=f'Balance: ${balance:,.2f}'
+            # Fetch live positions
+            _purl=f'{trader.TRADING_URL}/portfolio/positions'
+            _pr=_rq.get(_purl,headers=trader._signed_headers('GET',_purl),params={'limit':200},timeout=10)
+            _positions=_pr.json().get('market_positions',[]) if _pr.status_code==200 else []
+            _open=[p for p in _positions if float(p.get('market_exposure_dollars','0') or 0)>0]
+            _total_exp=sum(float(p.get('market_exposure_dollars','0') or 0) for p in _open)
+            _total_pnl=sum(float(p.get('realized_pnl_dollars','0') or 0) for p in _positions)
+            pos_str=f' | {len(_open)} live positions | exposure ${_total_exp:.0f} | realized P&L ${_total_pnl:+.0f}'
+            # Top 5 positions by exposure for context
+            _open.sort(key=lambda p:-float(p.get('market_exposure_dollars','0') or 0))
+            top_pos='\n'.join(f"  {p.get('ticker','')} pos={float(p.get('position_fp','0')):+.0f} exp=${float(p.get('market_exposure_dollars','0')):.0f} pnl=${float(p.get('realized_pnl_dollars','0')):+.2f}" for p in _open[:8])
+            bal_str+=pos_str+'\nTOP POSITIONS:\n'+top_pos
         except: bal_str=''
         live_ctx=f'\nLIVE FEEDS: {feed_line}\n{bal_str}'
         # Get scan candidates for context
@@ -103,17 +116,18 @@ Full system context:
 {ctx}{live_ctx}{scan_ctx}
 
 ACTIONS — these execute immediately when you output them:
-1. [TRADE: ticker=KXCPI-26APR-T0.8 side=YES amount=25 force=true] — place a trade NOW
-2. [SEARCH: keyword] — search Kalshi for markets matching keyword, returns results inline
-3. [SCAN] — show latest data-backed opportunities from scanner
-4. [COMMAND: text] — ONLY for master agent ops (explore tools, set agents, heal). NEVER for trades or searches.
+1. [TRADE: ticker=KXCPI-26APR-T0.8 side=YES amount=25 force=true] — LIVE trade on Kalshi (real money, default)
+2. [TRADE: ticker=... side=... amount=... mode=paper force=true] — paper trade only
+3. [SEARCH: keyword] — search Kalshi for markets matching keyword
+4. [SCAN] — show data-backed opportunities from scanner
+5. [COMMAND: text] — ONLY for master agent ops. NEVER for trades or searches.
 
 RULES:
-- When the user says to trade, output [TRADE: ... force=true]. Do not queue. Do not ask. Execute.
-- When the user asks to find/search markets, output [SEARCH: keyword]. Do not queue a command.
+- ALL trades are LIVE by default. Real money on Kalshi. The user knows this.
+- When the user tells you to trade, output [TRADE: ... force=true]. Execute immediately. No essays.
+- When the user asks to find/search markets, output [SEARCH: keyword].
 - Output exactly ONE tag per action. Never duplicate.
-- Keep responses to 2-3 lines. No essays, no tables, no markdown headers.
-- This is real money. Be direct.'''
+- Keep responses to 2-3 lines. Show: ticker, side, price, amount. That is it.'''
         r=client.messages.create(model='claude-sonnet-4-6',max_tokens=1000,system=sys_p,
             messages=[*history,{'role':'user','content':msg}])
         resp=r.content[0].text
@@ -131,7 +145,7 @@ RULES:
                 try:
                     trade_req={'ticker':parts['ticker'],'side':parts.get('side','YES'),
                         'amount':float(parts.get('amount',0)),'force':parts.get('force','false').lower()=='true',
-                        'mode':parts.get('mode','paper')}
+                        'mode':parts.get('mode','live')}
                     # Call our own trade endpoint
                     async with httpx.AsyncClient() as hc:
                         tr=await hc.post('http://localhost:8000/api/trade',json=trade_req,timeout=30)
@@ -193,7 +207,7 @@ async def api_trade(req:Request):
         side=b.get('side','YES').upper()
         amount=float(b.get('amount',0))
         force=b.get('force',False)  # skip edge check (manual override)
-        mode=b.get('mode','paper')  # 'paper' or 'live'
+        mode=b.get('mode','live')  # 'live' (default) or 'paper'
         if not ticker: return JSONResponse({'error':'ticker required'},400)
         if side not in ('YES','NO'): return JSONResponse({'error':'side must be YES or NO'},400)
 
@@ -263,29 +277,47 @@ async def api_trade(req:Request):
         contract_id=db.upsert_contract(contract)
 
         if mode=='live' and config.live_trading_enabled:
-            # Live trade through guard
-            from live.guard import check_guard
+            from live.guard import LiveTradingGuard, compute_shares
             from live.kalshi_trader import KalshiTrader
-            guard_ok,guard_msg=check_guard(config,db,bet_amount)
-            if not guard_ok:
-                analysis['action']='BLOCKED'
-                analysis['reason']=f'Live guard: {guard_msg}'
+            trader=KalshiTrader(config)
+            guard=LiveTradingGuard(config,db,balance_provider=trader.get_balance)
+            price_dollars=entry_price  # 0-1 float
+            shares=compute_shares(bet_amount,price_dollars)
+            if shares<=0:
+                analysis['action']='DECLINED'
+                analysis['reason']=f'0 shares at ${price_dollars:.2f}/share for ${bet_amount:.2f}'
                 db.close()
                 return JSONResponse(analysis)
-            trader=KalshiTrader(config)
-            shares=max(1,int(bet_amount/entry_price))
-            order=trader.place_order(ticker,side.lower(),shares,entry_price)
-            if order:
-                db.insert_live_trade({'contract_id':contract_id,'kalshi_order_id':order.get('order_id',''),
-                    'kalshi_ticker':ticker,'side':side,'entry_price':entry_price,'shares':shares,
-                    'cost':round(shares*entry_price,2),'max_payout':shares,
-                    'model_prob':estimate.probability,'edge_at_entry':edge_result.edge})
+            cost=round(shares*price_dollars,2)
+            guard_result=guard.check_all(proposed_cost=cost)
+            if not guard_result.ok:
+                analysis['action']='BLOCKED'
+                analysis['reason']=f'Guard: {guard_result.reason}'
+                db.close()
+                return JSONResponse(analysis)
+            price_cents=max(1,min(99,int(round(price_dollars*100))))
+            try:
+                # Call Kalshi API directly (kalshi_trader.place_order has a client_order_id bug)
+                import requests as _rq2
+                _ourl=f'{trader.TRADING_URL}/portfolio/orders'
+                _opayload={'ticker':ticker,'side':side.lower(),'action':'buy','type':'limit','count':shares,
+                    'yes_price':price_cents if side=='YES' else None,'no_price':price_cents if side=='NO' else None}
+                _opayload={k:v for k,v in _opayload.items() if v is not None}
+                _oresp=_rq2.post(_ourl,headers=trader._signed_headers('POST',_ourl),json=_opayload,timeout=15)
+                _oresp.raise_for_status()
+                order=_oresp.json()
+                order_id=order.get('order',{}).get('order_id','') if isinstance(order.get('order'),dict) else ''
+                db.insert_live_trade({'contract_id':contract_id,'kalshi_order_id':order_id,
+                    'kalshi_ticker':ticker,'side':side,'entry_price':price_dollars,'shares':shares,
+                    'cost':cost,'max_payout':shares,'model_prob':estimate.probability,'edge_at_entry':edge_result.edge})
                 analysis['action']='LIVE_TRADE'
                 analysis['shares']=shares
-                analysis['cost']=round(shares*entry_price,2)
-            else:
+                analysis['cost']=cost
+                analysis['order_id']=order_id
+                analysis['price_cents']=price_cents
+            except Exception as oe:
                 analysis['action']='LIVE_FAILED'
-                analysis['reason']='Order placement failed'
+                analysis['reason']=str(oe)[:300]
         else:
             # Paper trade
             db.insert_paper_trade({'contract_id':contract_id,'side':side,'entry_price':entry_price,
