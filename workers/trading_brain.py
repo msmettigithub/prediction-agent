@@ -561,15 +561,29 @@ def main():
                 # Should we exit? Check with forecast_exit
                 if current_bid > 0.01:
                     ef = forecast_exit(ticker, side, shares, entry_price, current_bid)
-                    # EXIT RULES (learned the hard way):
-                    # 1. TAKE PROFIT: only if profitable AND fair value dropped below 90% of entry
-                    #    (meaning we got lucky — edge flipped, lock in gains)
-                    # 2. NO STOP LOSS on binary contracts — they resolve at $1 or $0.
-                    #    Selling at a loss is almost always wrong. The only time to stop out
-                    #    is if win_prob < 2% (virtually certain to lose) AND loss is > $20.
-                    #    Otherwise HOLD — the asymmetry (pay 10c, win $1) is the whole point.
-                    if ef.is_profitable and current_fair < entry_price * 0.90:
-                        exit_candidates.append(('TAKE_PROFIT', ef, hf))
+                    # EXIT RULES:
+                    # 1. RISK/REWARD TAKE-PROFIT: if we've captured most of the upside,
+                    #    remaining gain doesn't justify the risk of reversal.
+                    #    e.g. bought at 0.10, bid now 0.60 → gained 0.50, only 0.40 left.
+                    #    Remaining upside (0.40) < realized gain (0.50) → sell.
+                    # 2. EDGE-FLIP EXIT: fair value dropped below entry → our thesis is wrong.
+                    # 3. NEAR-CERTAIN LOSS: win_prob < 5% and we're down → cut the loss.
+                    gained = current_bid - entry_price
+                    remaining_upside = 1.0 - current_bid  # max payout is $1
+                    gain_multiple = gained / entry_price if entry_price > 0 else 0
+                    if ef.is_profitable and gain_multiple >= 2.0 and remaining_upside < gained:
+                        # We've made 2x+ entry AND remaining upside < what we've gained.
+                        # Risk/reward has flipped — lock in the profit.
+                        exit_candidates.append(('TAKE_PROFIT_RR', ef, hf))
+                        log(f"EXIT SIGNAL: {ticker} {side} gained=${gained:.2f}/sh "
+                            f"({gain_multiple:.1f}x entry) remaining=${remaining_upside:.2f} "
+                            f"→ take profit", 'INFO')
+                    elif ef.is_profitable and current_fair < entry_price * 0.90:
+                        # Edge flipped against us but we're still up — lock in gains.
+                        exit_candidates.append(('TAKE_PROFIT_EDGE_FLIP', ef, hf))
+                    elif win_prob < 0.05 and gained < -0.15:
+                        # Near-certain loss and meaningful money at stake — cut it.
+                        exit_candidates.append(('STOP_LOSS', ef, hf))
 
             # Log position summary every 60s
             if time.time() - last_db_log > 55 and hold_reports:
