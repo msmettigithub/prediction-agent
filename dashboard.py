@@ -389,6 +389,13 @@ def api_live_events():
     events=q("SELECT ts,event_type,message,data FROM trader_events ORDER BY id DESC LIMIT 50",db=TRADE_DB)
     return {'events':events}
 
+@app.get('/api/monitor')
+def api_monitor():
+    """Return live monitor state — spots, positions, alerts."""
+    try:
+        with open('/tmp/live_monitor.json') as f: return json.load(f)
+    except: return {'error':'Monitor not running. Start: python workers/live_monitor.py &'}
+
 @app.get('/api/pnl_timeline')
 def api_pnl_timeline():
     """Return cumulative P&L timeline from scalper trades."""
@@ -840,45 +847,63 @@ async function sc(){{const i=document.getElementById('ci');const msg=i.value.tri
 document.getElementById('ci').addEventListener('keydown',e=>{{if(e.key==='Enter'&&!e.shiftKey){{e.preventDefault();sc();}}}});
 async function sendCmd(){{const i=document.getElementById('cmi');const cmd=i.value.trim();const s=document.getElementById('cms');if(!cmd)return;s.textContent='Sending...';s.style.color='#ffaa00';try{{const r=await _f('/command',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{command:cmd}})}});const j=await r.json();if(j.ok){{s.textContent='Queued at '+j.queued_at+' ET';s.style.color='#00ff88';i.value='';}}else s.textContent='Error: '+j.error;}}catch(e){{s.textContent='Error: '+e;s.style.color='#ff4444';}}}}
 setInterval(()=>{{if(document.getElementById('pane-dash').classList.contains('active'))location.reload();}},30000);
-// Live Brain Feed
+// Live Monitor Feed
 let liveTimer=null;
 function loadLive(){{
   if(liveTimer)return;
   function refresh(){{
-    _f('/api/live_events').then(r=>r.json()).then(d=>{{
-      const el=document.getElementById('live-events');
-      if(!d.events||!d.events.length){{el.innerHTML='<div style=\"color:#333;padding:20px\">Waiting for trader events...</div>';return;}}
-      el.innerHTML=d.events.map(e=>{{
-        const colors={{status:'#555',scan:'#7c3aed',trade:'#00ff88',data:'#ffaa00',error:'#ff4444',calibration:'#00aaff'}};
-        const icons={{status:'📊',scan:'🔍',trade:'💰',data:'📡',error:'⚠️',calibration:'📐'}};
-        const col=colors[e.event_type]||'#888';
-        const icon=icons[e.event_type]||'📋';
-        const ts=e.ts?e.ts.slice(11,19):'';
-        let detail='';
-        if(e.data){{
-          try{{
-            const dd=JSON.parse(e.data);
-            if(dd.top_3&&dd.top_3.length){{
-              detail='<div style=\"margin-left:24px;color:#888;font-size:11px\">'+dd.top_3.map(t=>`${{t.side.toUpperCase()}} ${{t.ticker}} conf=${{(t.conf*100).toFixed(0)}}% edge=${{(t.edge*100).toFixed(1)}}c buf=${{(t.buffer*100).toFixed(1)}}%`).join(' | ')+'</div>';
-            }}
-            if(dd.btc){{
-              detail='<div style=\"margin-left:24px;color:#666;font-size:11px\">BTC=$${{Number(dd.btc).toLocaleString()}} DVOL=${{dd.dvol||\"?\"}} VIX=${{dd.vix||\"?\"}} DXY=${{dd.dxy||\"?\"}} F&G=${{dd.fear_greed||\"?\"}}</div>';
-            }}
-            if(dd.ticker){{
-              detail=`<div style=\"margin-left:24px;color:#aaa;font-size:11px\">${{dd.reasoning||''}} spot=$${{Number(dd.spot||0).toLocaleString()}} vol=${{(dd.vol*100).toFixed(1)}}%</div>`;
-            }}
-          }}catch(ex){{}}
-        }}
-        return `<div style=\"padding:6px 10px;border-bottom:1px solid #0f0f1a\"><span style=\"color:#444;font-size:10px\">${{ts}}</span> <span style=\"font-size:14px\">${{icon}}</span> <span style=\"color:${{col}};font-size:12px;font-weight:600\">${{e.event_type.toUpperCase()}}</span> <span style=\"color:#ccc;font-size:12px\">${{e.message}}</span>${{detail}}</div>`;
-      }}).join('');
-    }}).catch(()=>{{}});
-    // Also update feed badges
-    _f('/api/data_feeds').then(r=>r.json()).then(d=>{{
+    _f('/api/monitor').then(r=>r.json()).then(d=>{{
+      if(d.error){{document.getElementById('live-events').innerHTML=`<div style="color:#ff4444;padding:20px">${{d.error}}</div>`;return;}}
       const bar=document.getElementById('live-feeds-bar');
-      if(!d.feeds)return;
+      const el=document.getElementById('live-events');
+      // Spot prices bar
+      if(d.spots){{
+        bar.innerHTML=Object.entries(d.spots).map(([k,v])=>{{
+          const col=v.change>0?'#00ff88':v.change<0?'#ff4444':'#888';
+          return `<span style="background:#0a0a12;border:1px solid ${{col}}44;color:${{col}};padding:2px 6px;border-radius:4px;font-size:10px">${{k}}=${{Number(v.price).toLocaleString(undefined,{{maximumFractionDigits:2}})}} ${{v.change>0?'+':''}}${{v.change.toFixed(1)}}%</span>`;
+        }}).join('');
+      }}
+      // Portfolio summary
+      const p=d.portfolio||{{}};
+      const pc=p.net_pnl>=0?'#00ff88':'#ff4444';
+      let html=`<div style="padding:10px;border-bottom:1px solid #1a1a2e;display:flex;gap:16px;flex-wrap:wrap;font-size:13px">
+        <span style="color:#fff;font-weight:700">BAL $${Number(d.balance||0).toLocaleString()}</span>
+        <span>EXP $${(p.total_exposure||0).toFixed(0)}</span>
+        <span style="color:${pc};font-weight:700">NET $${(p.net_pnl||0)>=0?'+':''}}$${(p.net_pnl||0).toFixed(0)}</span>
+        <span style="color:#888">${{p.n_positions||0}} positions</span>
+      </div>`;
+      // Positions by series
+      if(p.by_series){{
+        html+=Object.entries(p.by_series).map(([s,v])=>{{
+          const uc=v.unrealized>=0?'#00ff88':'#ff4444';
+          return `<div style="padding:4px 10px;display:flex;justify-content:space-between;border-bottom:1px solid #0f0f1a"><span style="color:var(--accent);font-size:12px;font-weight:600">${{s}}</span><span style="font-size:12px"><span style="color:#888">exp=$${v.exposure.toFixed(0)}</span> <span style="color:${{uc}};font-weight:600">$${v.unrealized>=0?'+':''}}$${v.unrealized.toFixed(0)}</span> <span style="color:#555">${{v.count}}pos</span></span></div>`;
+        }}).join('');
+      }}
+      // Alerts
+      if(d.alerts&&d.alerts.length){{
+        html+=`<div style="padding:8px 10px;color:#ffaa00;font-size:11px;font-weight:700;border-bottom:1px solid #1a1a2e">EDGES DETECTED</div>`;
+        html+=d.alerts.map(a=>{{
+          return `<div style="padding:4px 10px;border-bottom:1px solid #0f0f1a;font-size:12px"><span style="color:#ffaa00;font-weight:600">${{a.side}}</span> <span style="color:#ddd">${{a.ticker}}</span> <span style="color:#00ff88">edge=${{(a.edge*100).toFixed(1)}}pp</span> <span style="color:#888">fair=${{(a.fair*100).toFixed(0)}}c mkt=${{(a.market*100).toFixed(0)}}c spot=$${Number(a.spot).toLocaleString()}</span></div>`;
+        }}).join('');
+      }}
+      // Top positions
+      if(d.positions&&d.positions.length){{
+        html+=`<div style="padding:8px 10px;color:#888;font-size:11px;font-weight:700;border-bottom:1px solid #1a1a2e">POSITIONS (by exposure)</div>`;
+        html+=d.positions.slice(0,15).map(p=>{{
+          const uc=p.total_pnl>=0?'#00ff88':'#ff4444';
+          return `<div style="padding:3px 10px;border-bottom:1px solid #0a0a12;font-size:11px"><span style="color:${{p.side==='LONG'?'#00ff88':'#ff4444'}};font-weight:600">${{p.side}}</span> <span style="color:#ccc">${{p.ticker}}</span> <span style="color:#888">${{p.shares}}sh exp=$${p.exposure}</span> <span style="color:${{uc}};font-weight:600">$${p.total_pnl>=0?'+':''}}$${p.total_pnl}</span> <span style="color:#555">spot=$${Number(p.spot).toLocaleString()} fair=${{(p.fair*100).toFixed(0)}}c</span></div>`;
+        }}).join('');
+      }}
+      el.innerHTML=html||'<div style="color:#333;padding:20px">Waiting for monitor data...</div>';
+    }}).catch(e=>{{document.getElementById('live-events').innerHTML=`<div style="color:#ff4444;padding:20px">Monitor error: ${{e}}</div>`;}});
+    // Keep old feed badges update as fallback
+    _f('/api/data_feeds').then(r=>r.json()).then(d=>{{
+      if(!d.feeds||!Object.keys(d.feeds).length)return;
+      const bar=document.getElementById('live-feeds-bar');
+      if(bar.children.length>0)return; // monitor already populated
       const badges=Object.entries(d.feeds).map(([k,v])=>{{
         const col=v&&v!=='N/A'&&v!=='0'?'#00ff88':'#333';
-        return `<span style=\"background:#0a0a12;border:1px solid ${{col}}44;color:${{col}};padding:2px 6px;border-radius:4px;font-size:10px\">${{k}}=${{v||'?'}}</span>`;
+        return `<span style="background:#0a0a12;border:1px solid ${{col}}44;color:${{col}};padding:2px 6px;border-radius:4px;font-size:10px">${{k}}=${{v||'?'}}</span>`;
       }}).join('');
       bar.innerHTML=badges;
     }}).catch(()=>{{}});
