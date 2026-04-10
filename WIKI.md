@@ -1,6 +1,42 @@
 # Karpathy Kapital - System Wiki
 *Persistent memory for Claude and the master agent. Updated automatically.*
-*Read this at the start of every new session to restore context.*
+
+## SESSION BOOTSTRAP — READ THIS FIRST
+
+You are resuming work on **Karpathy Kapital**, an autonomous Kalshi prediction market trading system. This is REAL MONEY. Here's what you need to know immediately:
+
+### Critical Context
+1. **Model was broken, now fixed (2026-04-10):** The old probability model used a universal 0.60 base rate for all economics contracts, generating FAKE 20pp+ edges. Backtested against 51 resolved contracts it lost $183. The fix: `model/data_modifiers.py` generates modifiers from real data only (Yahoo Finance vol, FRED CPI/GDP trends, econ calendar consensus). No data = no edge = no trade.
+2. **20 open paper trades exist** that were entered on the broken model. They will resolve on their own — do NOT enter new trades using flat base rates.
+3. **Workers pipeline** (`workers/`): resolver (fetches Kalshi resolutions), calibrator (computes Brier/accuracy), scanner (finds data-backed opportunities). May need restarting: `python workers/run_all.py &`
+
+### First Steps for Any New Session
+```bash
+# 1. Check system health
+curl -s http://localhost:8000/api/health | python -m json.tool
+
+# 2. If dashboard is down
+pip install fastapi uvicorn 2>/dev/null; python dashboard.py &
+
+# 3. If workers aren't running
+pgrep -f run_all || python workers/run_all.py &
+
+# 4. Run resolver to catch up on contract resolutions
+python workers/resolver.py
+
+# 5. Run tests
+python -m pytest tests/ -q  # must be >= 139
+
+# 6. Check what's open
+sqlite3 prediction_agent.db "SELECT c.source_id, pt.side, pt.entry_price, pt.model_prob, pt.status FROM paper_trades pt JOIN contracts c ON pt.contract_id=c.id ORDER BY pt.status, c.close_time"
+```
+
+### Rules — NEVER break these
+- `pytest` minimum: **139 tests**
+- NEVER modify: `live/`, `master_agent/safeguards.py`, `.env`
+- NEVER auto-enable live trading — human flips that switch
+- NEVER generate edges from flat base rates — every edge must trace to a real data source
+- ALWAYS audit model output before discussing trade thesis
 
 ## Quick Reference
 - Dashboard: https://pd-sm-kk-dashboard-9ad2711e1bd44434a4f324220fb537e9.community.saturnenterprise.io
