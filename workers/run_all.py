@@ -14,11 +14,12 @@ import time, subprocess, sys, os
 from datetime import datetime, timezone
 
 WORKERS = [
+    # Trading brain runs separately as its own process (2s cycles, observe/decide/act)
+    # Start it with: python -u workers/trading_brain.py
+    # These are support workers:
     {'name': 'fill_tracker', 'cmd': [sys.executable, 'workers/fill_tracker.py'], 'interval': 30},
     {'name': 'reconciler', 'cmd': [sys.executable, 'workers/reconciler.py'], 'interval': 60},
-    {'name': 'auto_trader', 'cmd': [sys.executable, 'workers/auto_trader.py'], 'interval': 60},
     {'name': 'resolver', 'cmd': [sys.executable, 'workers/resolver.py'], 'interval': 120},
-    {'name': 'scanner', 'cmd': [sys.executable, 'workers/scanner_worker.py'], 'interval': 120},
     {'name': 'calibrator', 'cmd': [sys.executable, 'workers/calibrator.py'], 'interval': 300},
 ]
 
