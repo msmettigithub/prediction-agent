@@ -164,6 +164,7 @@ This chat -> Claude creates Saturn job to inject into agent_commands DB
 (Updated by explorer agents - see tool_experiments DB table)
 
 ## Decision Log
+- 2026-04-10 21:13: v6: ASCII fix + JSON retry logic | rationale: UTF-8 encoding bug caused all orient calls to fail
 - 2026-04-10 19:28: v6: ASCII fix + JSON retry logic | rationale: UTF-8 encoding bug caused all orient calls to fail
 - 2026-04-10 19:07: v6: ASCII fix + JSON retry logic | rationale: UTF-8 encoding bug caused all orient calls to fail
 - 2026-04-10 03:19: CRITICAL FIX: Replaced phantom edge model with data-driven modifiers | rationale: Old model used universal 0.60 base rate for all economics, creating fake 20pp edges. Backtested: -$183 on 51 resolved. New model starts from market price, only deviates with real data (Yahoo vol, FRED, consensus). Built workers/resolver.py, calibrator.py, scanner_worker.py. Added /api/health endpoint with 8 automated checks. Dashboard now has Health tab, command queue in chat, positions tab.
