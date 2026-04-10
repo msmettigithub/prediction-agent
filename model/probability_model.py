@@ -84,9 +84,17 @@ def estimate_probability(
             log_odds += shift
 
     # Apply explicit modifiers (from real data tools) in log-odds space
-    for mod in modifiers:
-        shift = mod.direction * mod.weight * 0.5  # 0.5 log-odds max per modifier
-        log_odds += shift
+    # Scale with agreement: when modifiers agree in direction and have high
+    # weight, allow stronger shifts (up to 0.8 log-odds). When they disagree
+    # or weight is low, stay conservative (0.3 log-odds).
+    if modifiers:
+        directions = [m.direction for m in modifiers if m.weight > 0]
+        all_agree = all(d >= 0 for d in directions) or all(d <= 0 for d in directions) if directions else False
+        agreement = 1.0 if all_agree else 0.6
+        for mod in modifiers:
+            scale = 0.3 + (mod.weight * 0.5 * agreement)  # range: 0.3 to 0.8
+            shift = mod.direction * mod.weight * scale
+            log_odds += shift
 
     # Convert back to probability
     raw_prob = 1.0 / (1.0 + math.exp(-log_odds))

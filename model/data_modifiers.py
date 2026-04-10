@@ -96,8 +96,8 @@ def _inx_modifiers(
 
         # Direction and weight based on edge magnitude
         direction = 1.0 if edge > 0 else -1.0
-        # Weight scales with edge but caps at 0.8
-        weight = min(0.8, abs(edge) * 3)
+        # Weight scales with edge — vol-derived fair value is the strongest signal
+        weight = min(0.9, abs(edge) * 3)
 
         mods.append(Modifier(
             name="spx_realized_vol",
@@ -336,7 +336,8 @@ def _crypto_modifiers(
             return mods
 
         direction = 1.0 if edge > 0 else -1.0
-        weight = min(0.8, abs(edge) * 3)
+        # Vol-derived fair value is the strongest signal — allow higher weight
+        weight = min(0.9, abs(edge) * 3)
 
         mods.append(Modifier(
             name=f"{'eth' if 'ETH' in source_id else 'btc'}_realized_vol",
