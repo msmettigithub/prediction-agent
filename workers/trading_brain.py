@@ -244,10 +244,24 @@ def find_entries(markets, spots, existing_tickers, balance, intel=None):
                 if shares >= 1:
                     cost = shares * best_price
                     if cost <= balance * 0.05:
-                        entries.append({
-                            **opp, 'shares': shares, 'price': best_price,
-                            'cost': cost, 'expected_profit': round(best_edge * shares, 2),
-                        })
+                        # P&L FORECAST before entry
+                        from model.trade_pnl import forecast_entry
+                        win_prob = fair_yes if best_side == 'yes' else (1 - fair_yes)
+                        fc = forecast_entry(ticker, best_side, shares, best_price, win_prob)
+                        # Only enter if expected value is positive after fees
+                        if fc.expected_pnl > 0:
+                            entries.append({
+                                **opp, 'shares': shares, 'price': best_price,
+                                'cost': cost, 'expected_profit': fc.expected_pnl,
+                                'forecast': {
+                                    'profit_if_win': fc.profit_if_win,
+                                    'loss_if_lose': fc.loss_if_lose,
+                                    'roi_if_win': fc.roi_if_win,
+                                    'expected_roi': fc.expected_roi,
+                                    'breakeven_prob': fc.breakeven_prob,
+                                    'risk_reward': fc.risk_reward,
+                                },
+                            })
 
     opportunities.sort(key=lambda x: -x['edge'])
     entries.sort(key=lambda x: -x['edge'])
@@ -459,9 +473,12 @@ def main():
                     try:
                         order = place_order(trader, e['ticker'], e['side'], e['shares'], price_cents)
                         oid = order.get('order',{}).get('order_id','')[:12] if isinstance(order.get('order'), dict) else ''
-                        log(f"ENTER: BUY NO {e['ticker']} {e['shares']}sh @{price_cents}c "
-                            f"edge={e['edge']:+.0%} fair_yes={e['fair_yes']:.0%} spot=${e['spot']:,.0f} "
-                            f"hrs={e['hours']:.1f} | {oid}", 'MILESTONE')
+                        fc = e.get('forecast', {})
+                    log(f"ENTER: BUY {e['side'].upper()} {e['ticker']} {e['shares']}sh @{price_cents}c "
+                            f"edge={e['edge']:+.0%} EV=${e.get('expected_profit',0):+.2f} "
+                            f"win=${fc.get('profit_if_win',0):+.2f} lose=${fc.get('loss_if_lose',0):.2f} "
+                            f"r:r={fc.get('risk_reward',0):.1f} breakeven={fc.get('breakeven_prob',0):.0%} "
+                            f"| {oid}", 'MILESTONE')
                         total_entered += 1
                         existing_tickers.add(e['ticker'])
                     except Exception as ex:
