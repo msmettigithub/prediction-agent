@@ -411,8 +411,8 @@ def main():
                     try: balance = bal_f.result(); last_balance_check = time.time()
                     except: pass
 
-            # Refresh Kalshi markets every 10s
-            if time.time() - last_market_fetch > 10:
+            # Refresh Kalshi markets every 3s
+            if time.time() - last_market_fetch > 3:
                 event_tickers = build_event_tickers()
                 cached_markets = fetch_markets(event_tickers)
                 last_market_fetch = time.time()

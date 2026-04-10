@@ -217,17 +217,24 @@ def advise(obs,gate,rl,cid):
         'last_5_agent_changes':changes,
     },default=str)
     recs=[]
-    # Fan out to multiple models via OpenRouter
+    # Fan out to multiple models via OpenRouter IN PARALLEL
     if OPENROUTER_KEY:
-        for model_id,label in ADVISOR_MODELS:
+        import concurrent.futures
+        def _call_one(model_id,label):
             try:
                 r=_openrouter_call(model_id,ADVISOR_SYS,user_msg)
                 if r:
-                    recs.append(f'[{label}] {r}')
                     dbw("INSERT INTO agent_log(ts,cid,lvl,agent,msg) VALUES(?,?,?,?,?)",
                         (datetime.now(timezone.utc).isoformat(),cid,'INFO',f'advisor-{label}',r[:2000]))
+                    return f'[{label}] {r}'
             except Exception as e:
                 log(DB,f'[{cid}] advisor-{label} error:{e}','WARN',cid=cid)
+            return None
+        with concurrent.futures.ThreadPoolExecutor(len(ADVISOR_MODELS)) as ex:
+            futures={ex.submit(_call_one,mid,lbl):(mid,lbl) for mid,lbl in ADVISOR_MODELS}
+            for f in concurrent.futures.as_completed(futures,timeout=35):
+                r=f.result()
+                if r: recs.append(r)
     if recs: log(DB,f'[{cid}] ADVISE: {len(recs)}/{len(ADVISOR_MODELS)} models responded via OpenRouter','MILESTONE',cid=cid)
     # Fallback to direct Anthropic if OpenRouter unavailable or as additional signal
     if not recs:
@@ -386,12 +393,12 @@ def main():
                 except: pass
             if not ok_budget(): log(DB,f'Budget cap - sleeping 1hr','WARN',cid=cid); time.sleep(3600); continue
             since=time.time()-last_change
-            if since<3600: wait=min(speed,int(3600-since)); log(DB,f'[{cid}] Rate limit {wait}s',cid=cid); time.sleep(wait); continue
+            if since<600: wait=min(speed,int(600-since)); log(DB,f'[{cid}] Rate limit {wait}s',cid=cid); time.sleep(wait); continue
             log(DB,f'[{cid}] Launching {N_AGENTS} sub-agents',cid=cid)
             rq=Queue()
             threads=[threading.Thread(target=sub_agent,args=(f'agent-{i}',obs,gate,rl,rq),daemon=True) for i in range(N_AGENTS)]
             for t in threads: t.start()
-            for t in threads: t.join(timeout=180)
+            for t in threads: t.join(timeout=90)
             results=[]
             while not rq.empty(): results.append(rq.get())
             if results:
