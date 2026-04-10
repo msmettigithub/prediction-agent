@@ -474,11 +474,11 @@ def main():
                         order = place_order(trader, e['ticker'], e['side'], e['shares'], price_cents)
                         oid = order.get('order',{}).get('order_id','')[:12] if isinstance(order.get('order'), dict) else ''
                         fc = e.get('forecast', {})
-                    log(f"ENTER: BUY {e['side'].upper()} {e['ticker']} {e['shares']}sh @{price_cents}c "
-                            f"edge={e['edge']:+.0%} EV=${e.get('expected_profit',0):+.2f} "
-                            f"win=${fc.get('profit_if_win',0):+.2f} lose=${fc.get('loss_if_lose',0):.2f} "
-                            f"r:r={fc.get('risk_reward',0):.1f} breakeven={fc.get('breakeven_prob',0):.0%} "
-                            f"| {oid}", 'MILESTONE')
+                        log(f"ENTER: BUY {e['side'].upper()} {e['ticker']} {e['shares']}sh @{price_cents}c "
+                                f"edge={e['edge']:+.0%} EV=${e.get('expected_profit',0):+.2f} "
+                                f"win=${fc.get('profit_if_win',0):+.2f} lose=${fc.get('loss_if_lose',0):.2f} "
+                                f"r:r={fc.get('risk_reward',0):.1f} breakeven={fc.get('breakeven_prob',0):.0%} "
+                                f"| {oid}", 'MILESTONE')
                         total_entered += 1
                         existing_tickers.add(e['ticker'])
                     except Exception as ex:
@@ -486,13 +486,95 @@ def main():
             elif entries:
                 log(f"{len(entries)} entry signals (monitor-only, set BRAIN_TRADE_ENABLED=true to trade)", 'INFO')
 
-            # Exit logic DISABLED — previous version sold winning positions.
-            # TODO: rebuild exit logic that only sells when:
-            #   1. Position is profitable AND edge has flipped (take profit)
-            #   2. Position loss exceeds stop-loss threshold (cut loss)
-            # For now, hold all positions to settlement.
-            if exits:
-                log(f"{len(exits)} exit signals (not executing — hold to settlement)", 'INFO')
+            # ── POSITION EVALUATION — forecast every open position ──
+            from model.trade_pnl import forecast_hold, forecast_exit
+            hold_reports = []
+            exit_candidates = []
+            for p in positions:
+                ticker = p.get('ticker', '')
+                series = get_series(ticker)
+                if not series or series not in spots: continue
+
+                pos_fp = float(p.get('position_fp', '0') or 0)
+                if abs(pos_fp) < 0.01: continue
+                exp = float(p.get('market_exposure_dollars', '0') or 0)
+                shares = int(abs(pos_fp))
+                side = 'yes' if pos_fp > 0 else 'no'
+
+                # Get entry price from local DB
+                entry_price = exp / shares if shares > 0 else 0.50
+
+                # Current fair value
+                strike, is_threshold = parse_strike(ticker)
+                if strike is None: continue
+                spot = spots[series]
+                exp_str = cached_markets.get(ticker, {}).get('expiration_time') or cached_markets.get(ticker, {}).get('close_time') or ''
+                hours = 16.0
+                if exp_str:
+                    try:
+                        exp_dt = datetime.fromisoformat(exp_str.replace('Z', '+00:00'))
+                        hours = max(0.1, (exp_dt - datetime.now(timezone.utc)).total_seconds() / 3600)
+                    except: pass
+
+                fair_yes = compute_fair(spot.price, strike, spot.realized_vol, hours, is_threshold, series)
+                current_fair = fair_yes if side == 'yes' else 1 - fair_yes
+                win_prob = fair_yes if side == 'yes' else 1 - fair_yes
+
+                # Current bid from market
+                m = cached_markets.get(ticker, {})
+                if side == 'yes':
+                    current_bid = float(m.get('yes_bid_dollars', '0') or 0)
+                else:
+                    current_bid = float(m.get('no_bid_dollars', '0') or 0)
+
+                hf = forecast_hold(ticker, side, shares, entry_price,
+                                   current_fair, current_bid, win_prob)
+                hold_reports.append(hf)
+
+                # Should we exit? Check with forecast_exit
+                if current_bid > 0.01:
+                    ef = forecast_exit(ticker, side, shares, entry_price, current_bid)
+                    # EXIT RULES (learned the hard way):
+                    # 1. TAKE PROFIT: only if profitable AND fair value dropped below 90% of entry
+                    #    (meaning we got lucky — edge flipped, lock in gains)
+                    # 2. NO STOP LOSS on binary contracts — they resolve at $1 or $0.
+                    #    Selling at a loss is almost always wrong. The only time to stop out
+                    #    is if win_prob < 2% (virtually certain to lose) AND loss is > $20.
+                    #    Otherwise HOLD — the asymmetry (pay 10c, win $1) is the whole point.
+                    if ef.is_profitable and current_fair < entry_price * 0.90:
+                        exit_candidates.append(('TAKE_PROFIT', ef, hf))
+
+            # Log position summary every 60s
+            if time.time() - last_db_log > 55 and hold_reports:
+                winners = sum(1 for h in hold_reports if h.realizable_pnl > 0)
+                losers = sum(1 for h in hold_reports if h.realizable_pnl < 0)
+                total_unreal = sum(h.realizable_pnl for h in hold_reports)
+                log(f"POSITIONS: {len(hold_reports)} tracked, {winners}W/{losers}L, "
+                    f"realizable=${total_unreal:+.2f}")
+
+            # Execute exits only with P&L check
+            for reason, ef, hf in exit_candidates[:1]:  # max 1 exit per cycle
+                if not config.live_trading_enabled: continue
+                if not ef.is_profitable and reason != 'STOP_LOSS': continue
+                price_cents = max(1, min(99, int(round(ef.exit_price * 100))))
+                try:
+                    url = f'{trader.TRADING_URL}/portfolio/orders'
+                    payload = {'ticker': ef.ticker, 'side': ef.side, 'action': 'sell',
+                               'type': 'limit', 'count': ef.shares}
+                    if ef.side == 'yes':
+                        payload['yes_price'] = price_cents
+                    else:
+                        payload['no_price'] = price_cents
+                    resp = _kalshi.post(url, headers=trader._signed_headers('POST', url),
+                                      json=payload, timeout=15)
+                    resp.raise_for_status()
+                    oid = resp.json().get('order',{}).get('order_id','')[:12] if isinstance(resp.json().get('order'), dict) else ''
+                    log(f"EXIT {reason}: SELL {ef.side.upper()} {ef.ticker} {ef.shares}sh @{price_cents}c "
+                        f"pnl=${ef.realized_pnl:+.2f} ({ef.realized_roi:+.0%}) "
+                        f"entry={ef.entry_price:.2f} exit={ef.exit_price:.2f} | {oid}", 'MILESTONE')
+                    total_exited += 1
+                except Exception as ex:
+                    log(f"EXIT FAILED: {ef.ticker} — {str(ex)[:80]}", 'ERROR')
 
             # ── WRITE STATE ──
             net = total_pnl  # simplified — full MTM is in the old monitor
@@ -524,6 +606,14 @@ def main():
                            'hours': o['hours'], 'held': o.get('held', False),
                            'intel': o.get('intel', ''), 'intel_ok': o.get('intel_agrees', True)}
                           for o in opportunities[:15]],
+                'hold_reports': [{
+                    'ticker': h.ticker, 'side': h.side, 'shares': h.shares,
+                    'entry': h.entry_price, 'fair': h.current_fair, 'bid': h.current_bid,
+                    'unrealized': h.unrealized_pnl, 'realizable': h.realizable_pnl,
+                    'pnl_pct': h.pnl_pct, 'win_prob': h.win_probability, 'ev': h.expected_pnl,
+                } for h in sorted(hold_reports, key=lambda h: h.realizable_pnl)[:20]],
+                'exit_candidates': [{'reason': r, 'ticker': ef.ticker, 'pnl': ef.realized_pnl,
+                                     'profitable': ef.is_profitable} for r, ef, _ in exit_candidates],
                 'positions': [{
                     'ticker': p.get('ticker',''),
                     'series': get_series(p.get('ticker','')) or '',
