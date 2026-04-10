@@ -23,6 +23,12 @@ from config import load_config
 from live.kalshi_trader import KalshiTrader
 from tools.market_data import fetch_spot, binary_price
 
+# Persistent sessions for connection reuse (saves ~100ms/cycle)
+_yahoo_session = requests.Session()
+_yahoo_session.headers.update({'User-Agent': 'Mozilla/5.0'})
+_kalshi_session = requests.Session()
+_coingecko_session = requests.Session()
+
 TRADE_DB = str(Path(__file__).resolve().parent.parent / 'prediction_agent.db')
 LOG_DB = '/home/jovyan/shared/sm/prediction-agent-db/prediction_agent.db'
 STATE_FILE = '/tmp/live_monitor.json'
@@ -71,7 +77,7 @@ def get_series(ticker):
 def fetch_positions(trader):
     """Get all open positions from Kalshi."""
     url = f"{trader.TRADING_URL}/portfolio/positions"
-    r = requests.get(url, headers=trader._signed_headers("GET", url),
+    r = _kalshi_session.get(url, headers=trader._signed_headers("GET", url),
                      params={'limit': 200}, timeout=15)
     r.raise_for_status()
     positions = r.json().get('market_positions', [])
@@ -202,18 +208,75 @@ def scan_opportunities(spots, trader):
     return sorted(alerts, key=lambda x: -x['edge'])
 
 
+def _fetch_spot_fast(symbol):
+    """Fetch spot using persistent session. ~80ms vs ~200ms."""
+    from dataclasses import dataclass
+    import math as _m
+    r = _yahoo_session.get(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+        params={"interval": "1m", "range": "1d"}, timeout=5)
+    r.raise_for_status()
+    data = r.json()["chart"]["result"][0]
+    meta = data["meta"]
+    closes = [c for c in data["indicators"]["quote"][0]["close"] if c]
+    realized_vol = 0.025
+    if len(closes) > 20:
+        rets = [_m.log(closes[i] / closes[i-1]) for i in range(1, len(closes)) if closes[i] and closes[i-1]]
+        if rets:
+            mean_r = sum(rets) / len(rets)
+            var = sum((r - mean_r)**2 for r in rets) / len(rets)
+            realized_vol = _m.sqrt(var * len(rets))
+    from tools.market_data import SpotData
+    return SpotData(
+        price=meta["regularMarketPrice"], prev_close=meta["previousClose"],
+        change_pct=(meta["regularMarketPrice"] - meta["previousClose"]) / meta["previousClose"] * 100,
+        high=max(closes) if closes else meta["regularMarketPrice"],
+        low=min(closes) if closes else meta["regularMarketPrice"],
+        realized_vol=max(0.005, realized_vol), source="yahoo", timestamp=time.time())
+
+
+def _fetch_crypto_fast():
+    """Fetch BTC+ETH from CoinGecko in one call. ~30ms vs ~200ms from Yahoo."""
+    from tools.market_data import SpotData
+    r = _coingecko_session.get(
+        'https://api.coingecko.com/api/v3/simple/price',
+        params={'ids': 'bitcoin,ethereum', 'vs_currencies': 'usd',
+                'include_24hr_change': 'true'}, timeout=5)
+    r.raise_for_status()
+    d = r.json()
+    results = {}
+    if 'bitcoin' in d:
+        results['KXBTCD'] = SpotData(
+            price=d['bitcoin']['usd'], prev_close=d['bitcoin']['usd'],
+            change_pct=d['bitcoin'].get('usd_24h_change', 0) or 0,
+            high=d['bitcoin']['usd'], low=d['bitcoin']['usd'],
+            realized_vol=0.015, source='coingecko', timestamp=time.time())
+    if 'ethereum' in d:
+        results['KXETH'] = SpotData(
+            price=d['ethereum']['usd'], prev_close=d['ethereum']['usd'],
+            change_pct=d['ethereum'].get('usd_24h_change', 0) or 0,
+            high=d['ethereum']['usd'], low=d['ethereum']['usd'],
+            realized_vol=0.020, source='coingecko', timestamp=time.time())
+    return results
+
+
 def _fetch_all_spots():
-    """Fetch all spot prices in parallel. ~200ms total."""
+    """Fetch all spot prices. Crypto from CoinGecko (~30ms), rest from Yahoo (~100ms each).
+    Total ~150ms with sessions and parallelism."""
     spots = {}
-    symbols = list(SPOT_SYMBOLS.items())
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(symbols)) as ex:
-        futures = {ex.submit(fetch_spot, sym): series for series, sym in symbols}
-        for f in concurrent.futures.as_completed(futures):
-            series = futures[f]
-            try:
-                spots[series] = f.result()
-            except:
-                pass
+    non_crypto = [(s, sym) for s, sym in SPOT_SYMBOLS.items() if s not in ('KXBTCD', 'KXETH')]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        # Crypto in one fast call
+        crypto_f = ex.submit(_fetch_crypto_fast)
+        # Yahoo for WTI, Gold, S&P in parallel
+        yahoo_futures = {ex.submit(_fetch_spot_fast, sym): series for series, sym in non_crypto}
+        # Collect
+        try:
+            spots.update(crypto_f.result())
+        except: pass
+        for f in concurrent.futures.as_completed(yahoo_futures):
+            try: spots[yahoo_futures[f]] = f.result()
+            except: pass
     return spots
 
 
@@ -318,9 +381,9 @@ def main():
             time.sleep(1)  # brief pause only on error
             continue
 
-        # Tight loop: only sleep the remainder to hit target cycle time
+        # Tight loop: target 1s cycles — 60 updates/minute
         elapsed = time.time() - t_start
-        target = 3.0  # 3 second cycles — 20 updates/minute
+        target = 1.0
         remaining = max(0, target - elapsed)
         if remaining > 0:
             time.sleep(remaining)
