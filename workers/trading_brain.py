@@ -172,9 +172,11 @@ def compute_fair(spot, strike, vol, hours, is_threshold, series):
                    - binary_price(spot, strike + width, vol, hours))
 
 
-def find_entries(markets, spots, existing_tickers, balance):
+def find_entries(markets, spots, existing_tickers, balance, intel=None):
     """Find ALL mispriced contracts — both YES and NO side.
+    Uses market intel to adjust edge thresholds and skip trades that go against conviction.
     Returns entries (actionable trades) and opportunities (all edges for logging)."""
+    if intel is None: intel = {}
     entries = []
     opportunities = []
 
@@ -211,16 +213,33 @@ def find_entries(markets, spots, existing_tickers, balance):
         best_price = yes_ask if best_side == 'yes' else no_ask
 
         if best_edge > 0.03:  # log anything with >3pp edge
+            # Check intel — does the data agree with this trade?
+            view = intel.get(series)
+            intel_agrees = True
+            intel_note = ''
+            if view:
+                # If we want to buy YES (bullish), intel should not be bearish
+                # If we want to buy NO (bearish), intel should not be bullish
+                if best_side == 'yes' and view.is_bearish and view.conviction > 0.3:
+                    intel_agrees = False
+                    intel_note = f'intel={view.direction:+.2f} BEARISH blocks YES'
+                elif best_side == 'no' and view.is_bullish and view.conviction > 0.3:
+                    intel_agrees = False
+                    intel_note = f'intel={view.direction:+.2f} BULLISH blocks NO'
+                elif view.conviction > 0.2:
+                    intel_note = f'intel={view.direction:+.2f} agrees'
+
             opp = {
                 'ticker': ticker, 'side': best_side, 'edge': round(best_edge, 4),
                 'fair_yes': round(fair_yes, 4), 'yes_ask': yes_ask, 'no_ask': no_ask,
                 'spot': spot.price, 'strike': strike, 'hours': round(hours, 1),
                 'series': series, 'held': ticker in existing_tickers,
+                'intel': intel_note, 'intel_agrees': intel_agrees,
             }
             opportunities.append(opp)
 
-            # Only actionable if edge > threshold, not already held, affordable
-            if best_edge >= MIN_EDGE and ticker not in existing_tickers and best_price > 0.01:
+            # Only actionable if edge > threshold, not already held, affordable, AND intel agrees
+            if best_edge >= MIN_EDGE and ticker not in existing_tickers and best_price > 0.01 and intel_agrees:
                 shares = compute_shares(MAX_BET, best_price)
                 if shares >= 1:
                     cost = shares * best_price
@@ -382,6 +401,24 @@ def main():
             # Track what we hold
             existing_tickers = {p.get('ticker','') for p in positions}
 
+            # ── MARKET INTEL ──
+            try:
+                from model.market_intel import get_market_intel, format_intel
+                intel = get_market_intel(hours_ahead=16.0)
+                # Log intel every 60s
+                if time.time() - last_db_log > 55:
+                    log(f"INTEL: {format_intel(intel)}")
+                # Map series to intel
+                series_intel = {}
+                for name, view in intel.items():
+                    if name == 'WTI': series_intel['KXWTI'] = view
+                    elif name == 'BTC': series_intel['KXBTCD'] = view
+                    elif name == 'GOLD': series_intel['KXGOLDW'] = view
+                    elif name == 'SPX': series_intel['KXINX'] = view
+                    elif name == 'ETH': series_intel['KXETH'] = view
+            except Exception as ie:
+                intel = {}; series_intel = {}
+
             # ── DECIDE ──
             # MTM
             total_exp = sum(float(p.get('market_exposure_dollars','0') or 0) for p in positions)
@@ -393,11 +430,11 @@ def main():
                     by_series[s]['exp'] += float(p.get('market_exposure_dollars','0') or 0)
                     by_series[s]['n'] += 1
 
-            # Find entries + all opportunities
+            # Find entries + all opportunities (with intel)
             entries = []
             opportunities = []
             if balance > 0:
-                entries, opportunities = find_entries(cached_markets, spots, existing_tickers, balance)
+                entries, opportunities = find_entries(cached_markets, spots, existing_tickers, balance, series_intel)
 
             # Find exits
             exits = find_exits(positions, spots, cached_markets)
@@ -459,11 +496,16 @@ def main():
                 'exit_signals': len(exits),
                 'total_entered': total_entered,
                 'total_exited': total_exited,
+                'intel': {name: {'dir': v.direction, 'conv': v.conviction, 'vol': v.vol_regime,
+                                 'range': [v.expected_low, v.expected_high],
+                                 'signals': [{'name': s.name, 'dir': s.direction, 'src': s.source} for s in v.signals]}
+                         for name, v in (intel.items() if intel else {})},
                 'alerts': [{'ticker': o['ticker'], 'side': o['side'].upper(), 'edge': o['edge'],
                            'fair': o['fair_yes'] if o['side']=='yes' else 1-o['fair_yes'],
                            'market': o['yes_ask'] if o['side']=='yes' else o['no_ask'],
                            'spot': o['spot'], 'strike': o['strike'], 'series': o['series'],
-                           'hours': o['hours'], 'held': o.get('held', False)}
+                           'hours': o['hours'], 'held': o.get('held', False),
+                           'intel': o.get('intel', ''), 'intel_ok': o.get('intel_agrees', True)}
                           for o in opportunities[:15]],
                 'positions': [{
                     'ticker': p.get('ticker',''),

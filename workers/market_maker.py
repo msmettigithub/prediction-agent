@@ -301,6 +301,19 @@ def main():
                 if s: series_exp[s] += abs(qty) * 0.50
             risk_ok, risk_reason = check_risk(positions, balance, daily_pnl, series_exp)
 
+            # 4b. Market intel — skew quotes based on direction
+            try:
+                from model.market_intel import get_market_intel
+                intel = get_market_intel(hours_ahead=14.0)
+                intel_map = {}
+                for name, view in intel.items():
+                    if name == 'WTI': intel_map['KXWTI'] = view
+                    elif name == 'BTC': intel_map['KXBTCD'] = view
+                    elif name == 'GOLD': intel_map['KXGOLDW'] = view
+                    elif name == 'SPX': intel_map['KXINX'] = view
+            except:
+                intel_map = {}
+
             # 5. Find quotable markets — near spot, with liquidity
             quotes_to_place = []
             for ticker, m in cached_markets.items():
@@ -351,8 +364,14 @@ def main():
                 if series_exp.get(series, 0) >= MAX_EXPOSURE_PER_SERIES and abs(inventory) == 0:
                     continue  # don't open new positions in overweight series
 
-                # Compute quotes
-                bid, ask = compute_quotes(fair, inventory)
+                # Compute quotes — skew based on market intel
+                view = intel_map.get(series)
+                intel_skew = 0
+                if view and view.conviction > 0.2:
+                    # If bullish: raise both bid and ask (willing to pay more for YES)
+                    # If bearish: lower both (want to sell YES cheaper)
+                    intel_skew = view.direction * view.conviction * 0.02  # max 2c skew
+                bid, ask = compute_quotes(fair + intel_skew, inventory)
                 bid_cents = max(1, min(99, int(round(bid * 100))))
                 ask_cents = max(1, min(99, int(round(ask * 100))))
 
