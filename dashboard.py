@@ -882,9 +882,37 @@ function loadLive(){{
           return `<div style="padding:4px 10px;display:flex;justify-content:space-between;border-bottom:1px solid #0f0f1a"><span style="color:var(--accent);font-size:12px;font-weight:600">${{s}}</span><span style="font-size:12px"><span style="color:#888">exp=$${{vexp.toFixed(0)}}</span> <span style="color:${{uc}};font-weight:600">${{vn}}pos</span></span></div>`;
         }}).join('');
       }}
+      // LLM Ideas
+      const ideas=d.llm_ideas||[];
+      if(ideas.length){{
+        html+=`<div style="padding:8px 10px;color:#7c3aed;font-size:11px;font-weight:700;border-bottom:1px solid #1a1a2e">AI TRADE IDEAS</div>`;
+        html+=ideas.map(i=>{{
+          const sc=i.side==='yes'?'#00ff88':'#ff4444';
+          return `<div style="padding:5px 10px;border-bottom:1px solid #0f0f1a;font-size:12px;background:#0d0d1a"><span style="color:${{sc}};font-weight:700">${{i.side.toUpperCase()}}</span> <span style="color:#ddd">${{i.ticker}}</span> <span style="color:#7c3aed">conv=${{Math.round((i.conviction||0)*100)}}%</span> <span style="color:#888">size=${{Math.round((i.size_pct||0)*100)}}%</span><div style="color:#aaa;font-size:11px;margin-top:2px;padding-left:4px">${{i.reason||''}}</div></div>`;
+        }}).join('');
+      }}
+      // Exit candidates
+      const exits=d.exit_candidates||[];
+      if(exits.length){{
+        html+=`<div style="padding:8px 10px;color:#ff4444;font-size:11px;font-weight:700;border-bottom:1px solid #1a1a2e">EXIT SIGNALS</div>`;
+        html+=exits.map(e=>{{
+          return `<div style="padding:4px 10px;border-bottom:1px solid #0f0f1a;font-size:12px"><span style="color:#ff4444;font-weight:600">${{e.reason}}</span> <span style="color:#ddd">${{e.ticker}}</span> <span style="color:${{e.profitable?'#00ff88':'#ff4444'}}">pnl=$${{e.pnl>=0?'+':''}}${{e.pnl.toFixed(2)}} ${{e.profitable?'PROFIT':'LOSS'}}</span></div>`;
+        }}).join('');
+      }}
+      // Market intel detail
+      const intelData=d.intel||{{}};
+      if(Object.keys(intelData).length){{
+        html+=`<div style="padding:8px 10px;color:#00aaff;font-size:11px;font-weight:700;border-bottom:1px solid #1a1a2e">MARKET INTEL</div>`;
+        html+=Object.entries(intelData).map(([name,v])=>{{
+          const dc=v.dir>0.2?'#00ff88':v.dir<-0.2?'#ff4444':'#888';
+          const dir=v.dir>0.2?'BULL':v.dir<-0.2?'BEAR':'FLAT';
+          const sigs=(v.signals||[]).map(s=>s.name+'('+s.dir.toFixed(1)+')').join(' ');
+          return `<div style="padding:3px 10px;border-bottom:1px solid #0a0a12;font-size:11px"><span style="color:${{dc}};font-weight:700">${{name}} ${{dir}}</span> <span style="color:#888">conv=${{Math.round(v.conv*100)}}% vol=${{v.vol}}</span> <span style="color:#555">${{sigs}}</span></div>`;
+        }}).join('');
+      }}
       // Alerts
       if(d.alerts&&d.alerts.length){{
-        html+=`<div style="padding:8px 10px;color:#ffaa00;font-size:11px;font-weight:700;border-bottom:1px solid #1a1a2e">EDGES DETECTED</div>`;
+        html+=`<div style="padding:8px 10px;color:#ffaa00;font-size:11px;font-weight:700;border-bottom:1px solid #1a1a2e">EDGES (${{d.alerts.length}})</div>`;
         html+=d.alerts.map(a=>{{
           return `<div style="padding:4px 10px;border-bottom:1px solid #0f0f1a;font-size:12px"><span style="color:#ffaa00;font-weight:600">${{a.side}}</span> <span style="color:#ddd">${{a.ticker}}</span> <span style="color:#00ff88">edge=${{(a.edge*100).toFixed(1)}}pp</span> <span style="color:#888">fair=${{(a.fair*100).toFixed(0)}}c mkt=${{(a.market*100).toFixed(0)}}c spot=$${{Number(a.spot).toLocaleString()}}</span></div>`;
         }}).join('');
