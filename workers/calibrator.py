@@ -1,62 +1,137 @@
-import math
 import logging
+import math
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-SHARPEN_FACTOR = 1.6
-
-BASE_RATE_BLEND_WEIGHT = 0.3
-
-def sharpen_probability(p: float, sharpen_factor: float = SHARPEN_FACTOR) -> float:
-    p = max(1e-6, min(1 - 1e-6, p))
-    logit = math.log(p / (1.0 - p))
-    scaled_logit = logit * sharpen_factor
-    p_sharp = 1.0 / (1.0 + math.exp(-scaled_logit))
-    p_sharp = max(0.05, min(0.95, p_sharp))
-    return p_sharp
+DEFAULT_EXTREMIZE_EXPONENT = 1.5
+PROBABILITY_FLOOR = 0.05
+PROBABILITY_CEILING = 0.95
 
 
-def blend_with_base_rate(p: float, base_rate: float, base_rate_weight: float = BASE_RATE_BLEND_WEIGHT) -> float:
-    blended = (1.0 - base_rate_weight) * p + base_rate_weight * base_rate
-    return max(0.05, min(0.95, blended))
+def extremize(p: float, d: float = DEFAULT_EXTREMIZE_EXPONENT) -> float:
+    p_clamped = max(1e-9, min(1 - 1e-9, p))
+    pd = p_clamped ** d
+    one_minus_pd = (1.0 - p_clamped) ** d
+    denom = pd + one_minus_pd
+    if denom == 0.0:
+        return p_clamped
+    return pd / denom
 
 
-def calibrate(p: float, category: Optional[str] = None, base_rates: Optional[dict] = None, sharpen_factor: float = SHARPEN_FACTOR) -> float:
-    p = max(1e-9, min(1 - 1e-9, p))
+def clamp(p: float, floor: float = PROBABILITY_FLOOR, ceiling: float = PROBABILITY_CEILING) -> float:
+    return max(floor, min(ceiling, p))
 
-    pre_sharpen = p
-    logger.debug(f"calibrate: pre_sharpen={pre_sharpen:.6f}, category={category}")
 
-    p_sharp = sharpen_probability(p, sharpen_factor=sharpen_factor)
-
-    if base_rates is not None and category is not None and category in base_rates:
-        base_rate = base_rates[category]
-        base_rate = max(0.05, min(0.95, float(base_rate)))
-        p_final = blend_with_base_rate(p_sharp, base_rate)
-        logger.debug(
-            f"calibrate: post_sharpen={p_sharp:.6f}, base_rate={base_rate:.6f}, "
-            f"blended={p_final:.6f}, category={category}"
+def get_exponent_from_config(config: Optional[dict]) -> float:
+    if config is None:
+        return DEFAULT_EXTREMIZE_EXPONENT
+    try:
+        val = config.get("extremize_exponent", DEFAULT_EXTREMIZE_EXPONENT)
+        return float(val)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid extremize_exponent in config, using default %.2f",
+            DEFAULT_EXTREMIZE_EXPONENT,
         )
-    else:
-        p_final = p_sharp
-        logger.debug(
-            f"calibrate: post_sharpen={p_sharp:.6f} (no base_rate blend), "
-            f"category={category}"
-        )
+        return DEFAULT_EXTREMIZE_EXPONENT
 
+
+def calibrate(p: float, config: Optional[dict] = None) -> float:
+    logger.debug("calibrate input: p=%.6f", p)
+
+    p = max(0.0, min(1.0, p))
+
+    adjusted = _apply_existing_calibration(p, config)
+    logger.debug("post-existing-calibration: p=%.6f", adjusted)
+
+    d = get_exponent_from_config(config)
+
+    pre_ext = adjusted
+    post_ext = extremize(adjusted, d=d)
     logger.info(
-        f"SHARPEN_LOG pre={pre_sharpen:.6f} post={p_final:.6f} "
-        f"delta={p_final - pre_sharpen:+.6f} factor={sharpen_factor} category={category}"
+        "extremize: pre=%.6f post=%.6f exponent=%.3f",
+        pre_ext,
+        post_ext,
+        d,
     )
 
-    return p_final
+    final = clamp(post_ext, floor=PROBABILITY_FLOOR, ceiling=PROBABILITY_CEILING)
+    if final != post_ext:
+        logger.info(
+            "clamp applied: pre_clamp=%.6f final=%.6f",
+            post_ext,
+            final,
+        )
+
+    logger.debug("calibrate output: p=%.6f", final)
+    return final
 
 
-def calibrate_batch(probabilities: list, categories: Optional[list] = None, base_rates: Optional[dict] = None, sharpen_factor: float = SHARPEN_FACTOR) -> list:
-    if categories is None:
-        categories = [None] * len(probabilities)
-    results = []
-    for p, cat in zip(probabilities, categories):
-        results.append(calibrate(p, category=cat, base_rates=base_rates, sharpen_factor=sharpen_factor))
-    return results
+def _apply_existing_calibration(p: float, config: Optional[dict]) -> float:
+    if config is None:
+        return p
+
+    bias = config.get("bias_correction", 0.0)
+    try:
+        bias = float(bias)
+    except (TypeError, ValueError):
+        bias = 0.0
+
+    if bias != 0.0:
+        logit = _logit(p)
+        logit_adjusted = logit + bias
+        p = _sigmoid(logit_adjusted)
+        logger.debug("bias_correction=%.4f applied, new p=%.6f", bias, p)
+
+    alpha = config.get("sharpen_alpha", None)
+    if alpha is not None:
+        try:
+            alpha = float(alpha)
+            if alpha != 1.0:
+                logit = _logit(p)
+                logit_sharpened = logit * alpha
+                p = _sigmoid(logit_sharpened)
+                logger.debug(
+                    "sharpen_alpha=%.4f applied, new p=%.6f", alpha, p
+                )
+        except (TypeError, ValueError):
+            pass
+
+    return p
+
+
+def _logit(p: float) -> float:
+    p = max(1e-12, min(1 - 1e-12, p))
+    return math.log(p / (1.0 - p))
+
+
+def _sigmoid(x: float) -> float:
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    exp_x = math.exp(x)
+    return exp_x / (1.0 + exp_x)
+
+
+def should_trade(p: float, min_delta: float = 0.06) -> bool:
+    return abs(p - 0.5) > min_delta
+
+
+def mean_separation(yes_probs: list, no_probs: list) -> Optional[float]:
+    if not yes_probs or not no_probs:
+        logger.warning(
+            "mean_separation called with empty list: yes=%d no=%d",
+            len(yes_probs),
+            len(no_probs),
+        )
+        return None
+    mean_yes = sum(yes_probs) / len(yes_probs)
+    mean_no = sum(no_probs) / len(no_probs)
+    sep = mean_yes - mean_no
+    logger.info(
+        "mean_separation: mean_yes=%.4f mean_no=%.4f separation=%.4f",
+        mean_yes,
+        mean_no,
+        sep,
+    )
+    return sep
