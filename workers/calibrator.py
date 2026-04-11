@@ -1,98 +1,105 @@
-import logging
 import math
+import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-
-def _get_alpha(num_agreeing_signals: int) -> float:
-    if num_agreeing_signals >= 6:
-        return 1.8
-    elif num_agreeing_signals >= 4:
-        return 1.5
-    elif num_agreeing_signals >= 2:
-        return 1.3
-    else:
-        return 1.0
+CALIBRATION_STRETCH_FACTOR = 1.5
+CALIBRATION_STRETCH_FACTOR_AGREEMENT = 1.7
+CALIBRATION_CLAMP_MIN = 0.05
+CALIBRATION_CLAMP_MAX = 0.95
 
 
-def sharpen_probability(p: float, num_agreeing_signals: int = 0) -> float:
-    alpha = _get_alpha(num_agreeing_signals)
-    p_clipped = max(1e-9, min(1 - 1e-9, p))
+def logit(p: float) -> float:
+    p = max(1e-9, min(1 - 1e-9, p))
+    return math.log(p / (1.0 - p))
 
-    p_alpha = p_clipped ** alpha
-    one_minus_p_alpha = (1.0 - p_clipped) ** alpha
-    denom = p_alpha + one_minus_p_alpha
 
-    if denom == 0.0:
-        p_sharp = p_clipped
-    else:
-        p_sharp = p_alpha / denom
+def sigmoid(l: float) -> float:
+    return 1.0 / (1.0 + math.exp(-l))
 
-    p_sharp = max(0.05, min(0.95, p_sharp))
 
-    logger.info(
-        "sharpen_probability: pre_sharp=%.6f post_sharp=%.6f alpha=%.2f "
-        "num_agreeing_signals=%d",
-        p,
-        p_sharp,
-        alpha,
-        num_agreeing_signals,
-    )
+def stretch_probability(p: float, k: float = CALIBRATION_STRETCH_FACTOR) -> float:
+    l = logit(p)
+    l_new = k * l
+    p_new = sigmoid(l_new)
+    return max(CALIBRATION_CLAMP_MIN, min(CALIBRATION_CLAMP_MAX, p_new))
 
-    return p_sharp
+
+def signals_agree(sentiment: Optional[float], trend: Optional[float], base_rate: Optional[float], threshold: float = 0.5) -> bool:
+    directions = []
+    if sentiment is not None:
+        directions.append(1 if sentiment > threshold else -1)
+    if trend is not None:
+        directions.append(1 if trend > threshold else -1)
+    if base_rate is not None:
+        directions.append(1 if base_rate > threshold else -1)
+    if len(directions) < 2:
+        return False
+    return len(set(directions)) == 1
 
 
 class Calibrator:
-    def __init__(self):
-        self._isotonic_model = None
-        self._platt_slope: Optional[float] = None
-        self._platt_intercept: Optional[float] = None
+    def __init__(
+        self,
+        stretch_factor: float = CALIBRATION_STRETCH_FACTOR,
+        stretch_factor_agreement: float = CALIBRATION_STRETCH_FACTOR_AGREEMENT,
+        clamp_min: float = CALIBRATION_CLAMP_MIN,
+        clamp_max: float = CALIBRATION_CLAMP_MAX,
+    ):
+        self.stretch_factor = stretch_factor
+        self.stretch_factor_agreement = stretch_factor_agreement
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
 
-    def _isotonic_adjust(self, p: float) -> float:
-        if self._isotonic_model is None:
-            return p
-        try:
-            import numpy as np
-            adjusted = self._isotonic_model.predict([[p]])[0]
-            return float(np.clip(adjusted, 1e-9, 1 - 1e-9))
-        except Exception as exc:
-            logger.warning("isotonic_adjust failed: %s", exc)
-            return p
-
-    def _platt_adjust(self, p: float) -> float:
-        if self._platt_slope is None or self._platt_intercept is None:
-            return p
-        try:
-            logit = math.log(p / (1.0 - p))
-            scaled = self._platt_slope * logit + self._platt_intercept
-            return 1.0 / (1.0 + math.exp(-scaled))
-        except (ValueError, ZeroDivisionError, OverflowError) as exc:
-            logger.warning("platt_adjust failed: %s", exc)
-            return p
-
-    def calibrate(self, p: float, num_agreeing_signals: int = 0) -> float:
-        p = max(1e-9, min(1 - 1e-9, p))
-
-        p = self._isotonic_adjust(p)
-        p = self._platt_adjust(p)
-
-        p = max(1e-9, min(1 - 1e-9, p))
-
-        logger.debug("calibrate: post_base_calibration=%.6f", p)
-
-        p = sharpen_probability(p, num_agreeing_signals=num_agreeing_signals)
-
+    def _base_calibrate(self, p: float) -> float:
         return p
 
-    def adjust(self, p: float, num_agreeing_signals: int = 0) -> float:
-        return self.calibrate(p, num_agreeing_signals=num_agreeing_signals)
+    def calibrate(
+        self,
+        p: float,
+        sentiment: Optional[float] = None,
+        trend: Optional[float] = None,
+        base_rate: Optional[float] = None,
+    ) -> float:
+        p_base = self._base_calibrate(p)
 
-    def fit_platt(self, slope: float, intercept: float) -> None:
-        self._platt_slope = slope
-        self._platt_intercept = intercept
-        logger.info("fit_platt: slope=%.4f intercept=%.4f", slope, intercept)
+        agreement = signals_agree(sentiment, trend, base_rate)
+        k = self.stretch_factor_agreement if agreement else self.stretch_factor
 
-    def fit_isotonic(self, model) -> None:
-        self._isotonic_model = model
-        logger.info("fit_isotonic: model fitted")
+        if agreement:
+            logger.debug(
+                "Multiple signals agree in direction; applying higher stretch factor k=%.2f", k
+            )
+        else:
+            logger.debug("Applying standard stretch factor k=%.2f", k)
+
+        p_stretched = stretch_probability(p_base, k=k)
+        logger.debug(
+            "Calibration: raw=%.4f base=%.4f k=%.2f stretched=%.4f",
+            p, p_base, k, p_stretched,
+        )
+        return p_stretched
+
+    def adjust(
+        self,
+        p: float,
+        sentiment: Optional[float] = None,
+        trend: Optional[float] = None,
+        base_rate: Optional[float] = None,
+    ) -> float:
+        return self.calibrate(p, sentiment=sentiment, trend=trend, base_rate=base_rate)
+
+
+_default_calibrator = Calibrator()
+
+
+def calibrate(
+    p: float,
+    sentiment: Optional[float] = None,
+    trend: Optional[float] = None,
+    base_rate: Optional[float] = None,
+    calibrator: Optional[Calibrator] = None,
+) -> float:
+    cal = calibrator if calibrator is not None else _default_calibrator
+    return cal.calibrate(p, sentiment=sentiment, trend=trend, base_rate=base_rate)
