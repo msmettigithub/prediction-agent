@@ -1,137 +1,113 @@
+import numpy as np
 import logging
-import math
-from typing import Optional
+from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_EXTREMIZE_EXPONENT = 1.5
-PROBABILITY_FLOOR = 0.05
-PROBABILITY_CEILING = 0.95
+
+CATEGORY_BASE_RATES: Dict[str, float] = {
+    "default": 0.50,
+    "earnings_beat": 0.52,
+    "earnings_miss": 0.48,
+    "momentum": 0.53,
+    "reversal": 0.47,
+    "breakout": 0.51,
+    "breakdown": 0.49,
+    "macro_positive": 0.51,
+    "macro_negative": 0.49,
+}
 
 
-def extremize(p: float, d: float = DEFAULT_EXTREMIZE_EXPONENT) -> float:
-    p_clamped = max(1e-9, min(1 - 1e-9, p))
-    pd = p_clamped ** d
-    one_minus_pd = (1.0 - p_clamped) ** d
-    denom = pd + one_minus_pd
-    if denom == 0.0:
-        return p_clamped
-    return pd / denom
+def _compute_alpha(signal_count: int, signal_consistent: bool) -> float:
+    if signal_count < 2:
+        return 1.0
+    if signal_count >= 5 and signal_consistent:
+        return 2.0
+    if signal_count >= 3:
+        return 1.5
+    return 1.2
 
 
-def clamp(p: float, floor: float = PROBABILITY_FLOOR, ceiling: float = PROBABILITY_CEILING) -> float:
-    return max(floor, min(ceiling, p))
+def extremize(p: float, alpha: float) -> float:
+    p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+    numerator = p ** alpha
+    denominator = numerator + (1.0 - p) ** alpha
+    return float(numerator / denominator)
 
 
-def get_exponent_from_config(config: Optional[dict]) -> float:
-    if config is None:
-        return DEFAULT_EXTREMIZE_EXPONENT
-    try:
-        val = config.get("extremize_exponent", DEFAULT_EXTREMIZE_EXPONENT)
-        return float(val)
-    except (TypeError, ValueError):
-        logger.warning(
-            "Invalid extremize_exponent in config, using default %.2f",
-            DEFAULT_EXTREMIZE_EXPONENT,
-        )
-        return DEFAULT_EXTREMIZE_EXPONENT
+def anchor_to_base_rate(
+    p_cal: float,
+    p_base: float,
+    w_base: float,
+    w_model: float,
+) -> float:
+    total = w_base + w_model
+    if total <= 0:
+        return p_cal
+    return float((w_base * p_base + w_model * p_cal) / total)
 
 
-def calibrate(p: float, config: Optional[dict] = None) -> float:
-    logger.debug("calibrate input: p=%.6f", p)
+def calibrate(
+    p_raw: float,
+    signal_count: int = 0,
+    signal_consistent: bool = False,
+    category: Optional[str] = None,
+    recency_weight: float = 1.0,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> float:
+    p_raw = float(np.clip(p_raw, 1e-6, 1.0 - 1e-6))
 
-    p = max(0.0, min(1.0, p))
+    alpha = _compute_alpha(signal_count, signal_consistent)
 
-    adjusted = _apply_existing_calibration(p, config)
-    logger.debug("post-existing-calibration: p=%.6f", adjusted)
+    p_cal = extremize(p_raw, alpha)
 
-    d = get_exponent_from_config(config)
+    cat_key = category if category in CATEGORY_BASE_RATES else "default"
+    p_base = CATEGORY_BASE_RATES[cat_key]
 
-    pre_ext = adjusted
-    post_ext = extremize(adjusted, d=d)
+    w_base = 1.0
+    w_model = float(np.clip(signal_count, 1, 10)) * recency_weight
+
+    p_final = anchor_to_base_rate(p_cal, p_base, w_base, w_model)
+    p_final = float(np.clip(p_final, 1e-6, 1.0 - 1e-6))
+
     logger.info(
-        "extremize: pre=%.6f post=%.6f exponent=%.3f",
-        pre_ext,
-        post_ext,
-        d,
+        "calibration | pre=%.4f | extremized=%.4f | final=%.4f | "
+        "alpha=%.2f | signals=%d | consistent=%s | category=%s | "
+        "w_base=%.2f | w_model=%.2f",
+        p_raw,
+        p_cal,
+        p_final,
+        alpha,
+        signal_count,
+        signal_consistent,
+        cat_key,
+        w_base,
+        w_model,
     )
 
-    final = clamp(post_ext, floor=PROBABILITY_FLOOR, ceiling=PROBABILITY_CEILING)
-    if final != post_ext:
-        logger.info(
-            "clamp applied: pre_clamp=%.6f final=%.6f",
-            post_ext,
-            final,
+    return p_final
+
+
+def calibrate_batch(
+    records: list,
+) -> list:
+    results = []
+    for rec in records:
+        p_raw = rec.get("probability", 0.5)
+        signal_count = rec.get("signal_count", 0)
+        signal_consistent = rec.get("signal_consistent", False)
+        category = rec.get("category", None)
+        recency_weight = rec.get("recency_weight", 1.0)
+        metadata = rec.get("metadata", None)
+
+        p_final = calibrate(
+            p_raw=p_raw,
+            signal_count=signal_count,
+            signal_consistent=signal_consistent,
+            category=category,
+            recency_weight=recency_weight,
+            metadata=metadata,
         )
+        results.append({**rec, "probability_calibrated": p_final})
 
-    logger.debug("calibrate output: p=%.6f", final)
-    return final
-
-
-def _apply_existing_calibration(p: float, config: Optional[dict]) -> float:
-    if config is None:
-        return p
-
-    bias = config.get("bias_correction", 0.0)
-    try:
-        bias = float(bias)
-    except (TypeError, ValueError):
-        bias = 0.0
-
-    if bias != 0.0:
-        logit = _logit(p)
-        logit_adjusted = logit + bias
-        p = _sigmoid(logit_adjusted)
-        logger.debug("bias_correction=%.4f applied, new p=%.6f", bias, p)
-
-    alpha = config.get("sharpen_alpha", None)
-    if alpha is not None:
-        try:
-            alpha = float(alpha)
-            if alpha != 1.0:
-                logit = _logit(p)
-                logit_sharpened = logit * alpha
-                p = _sigmoid(logit_sharpened)
-                logger.debug(
-                    "sharpen_alpha=%.4f applied, new p=%.6f", alpha, p
-                )
-        except (TypeError, ValueError):
-            pass
-
-    return p
-
-
-def _logit(p: float) -> float:
-    p = max(1e-12, min(1 - 1e-12, p))
-    return math.log(p / (1.0 - p))
-
-
-def _sigmoid(x: float) -> float:
-    if x >= 0:
-        return 1.0 / (1.0 + math.exp(-x))
-    exp_x = math.exp(x)
-    return exp_x / (1.0 + exp_x)
-
-
-def should_trade(p: float, min_delta: float = 0.06) -> bool:
-    return abs(p - 0.5) > min_delta
-
-
-def mean_separation(yes_probs: list, no_probs: list) -> Optional[float]:
-    if not yes_probs or not no_probs:
-        logger.warning(
-            "mean_separation called with empty list: yes=%d no=%d",
-            len(yes_probs),
-            len(no_probs),
-        )
-        return None
-    mean_yes = sum(yes_probs) / len(yes_probs)
-    mean_no = sum(no_probs) / len(no_probs)
-    sep = mean_yes - mean_no
-    logger.info(
-        "mean_separation: mean_yes=%.4f mean_no=%.4f separation=%.4f",
-        mean_yes,
-        mean_no,
-        sep,
-    )
-    return sep
+    return results
