@@ -1,172 +1,153 @@
-import numpy as np
-from scipy.special import expit, logit
 import logging
+import math
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SHRINKAGE_BASE = 0.12
-LOGISTIC_STRETCH_K = 1.4
-FLOOR = 0.08
-CEILING = 0.92
-SEPARATION_THRESHOLD = 0.10
 
+def calibrate_probability(
+    raw_probability: float,
+    category: str = "",
+    domain: str = "",
+    num_corroborating_signals: int = 0,
+    historical_rates: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Three-stage calibration pipeline:
+      Stage 1 - Base Rate Anchor
+      Stage 2 - Signal-Weighted Power Stretch
+      Stage 3 - Extremity Guard
 
-def _logistic_stretch(p: float, k: float = LOGISTIC_STRETCH_K) -> float:
-    p_clipped = np.clip(p, 1e-6, 1 - 1e-6)
-    logit_p = logit(p_clipped)
-    logit_half = logit(0.5)
-    stretched = expit(k * (logit_p - logit_half))
-    return float(np.clip(stretched, FLOOR, CEILING))
+    Returns a dict with 'probability' and 'calibration_metadata'.
+    """
+    if historical_rates is None:
+        historical_rates = {}
 
+    p = float(raw_probability)
+    p = max(0.001, min(0.999, p))
 
-def _count_corroborating_signals(signals: dict) -> int:
-    count = 0
-    base_rate = signals.get("base_rate")
-    trend = signals.get("trend")
-    sentiment = signals.get("sentiment")
+    # ------------------------------------------------------------------ #
+    # Stage 1 – Base Rate Anchor                                          #
+    # ------------------------------------------------------------------ #
+    base_rate: float | None = None
+    base_rate_sample_size: int = 0
 
-    direction = None
+    lookup_keys = []
+    if category and domain:
+        lookup_keys.append(f"{category}:{domain}")
+    if category:
+        lookup_keys.append(category)
+    if domain:
+        lookup_keys.append(domain)
+
+    for key in lookup_keys:
+        entry = historical_rates.get(key)
+        if entry and isinstance(entry, dict):
+            br = entry.get("resolution_rate")
+            ss = entry.get("sample_size", 0)
+            if br is not None and isinstance(br, (int, float)):
+                base_rate = float(br)
+                base_rate_sample_size = int(ss)
+                break
+
+    p_after_anchor = p
+    anchor_weight: float = 0.0
+
     if base_rate is not None:
-        if base_rate > 0.55:
-            direction = "up"
-            count += 1
-        elif base_rate < 0.45:
-            direction = "down"
-            count += 1
+        same_direction = (p > 0.5 and base_rate > 0.5) or (p < 0.5 and base_rate < 0.5)
+        if same_direction:
+            # Weight grows with sample size, capped so it never dominates entirely
+            # weight = 0 at n=0, asymptotes toward 0.35 at large n
+            anchor_weight = 0.35 * (1.0 - math.exp(-base_rate_sample_size / 200.0))
+            p_after_anchor = (1.0 - anchor_weight) * p + anchor_weight * base_rate
+            logger.debug(
+                "Stage 1 anchor: base_rate=%.4f sample_size=%d weight=%.4f "
+                "p %.4f -> %.4f",
+                base_rate,
+                base_rate_sample_size,
+                anchor_weight,
+                p,
+                p_after_anchor,
+            )
 
-    if trend is not None and direction is not None:
-        if direction == "up" and trend > 0.55:
-            count += 1
-        elif direction == "down" and trend < 0.45:
-            count += 1
+    # ------------------------------------------------------------------ #
+    # Stage 2 – Signal-Weighted Power Stretch                             #
+    # ------------------------------------------------------------------ #
+    # a = 1.0 + 0.15 * num_corroborating_signals, capped at 2.5
+    signals_capped = min(num_corroborating_signals, 10)  # 10 signals -> a=2.5
+    a = 1.0 + 0.15 * signals_capped
+    a = min(a, 2.5)
 
-    if sentiment is not None and direction is not None:
-        if direction == "up" and sentiment > 0.55:
-            count += 1
-        elif direction == "down" and sentiment < 0.45:
-            count += 1
-
-    return max(0, count - 1)
-
-
-def calibrate(raw_prob: float, signals: dict = None) -> float:
-    if signals is None:
-        signals = {}
-
-    raw_prob = float(np.clip(raw_prob, 1e-6, 1 - 1e-6))
-
-    corroborating = _count_corroborating_signals(signals)
-    shrinkage = SHRINKAGE_BASE * (0.5 ** corroborating)
-    shrinkage = max(shrinkage, 0.02)
-
-    shrunk = shrinkage * 0.5 + (1.0 - shrinkage) * raw_prob
-
-    stretched = _logistic_stretch(shrunk, k=LOGISTIC_STRETCH_K)
-
-    result = float(np.clip(stretched, FLOOR, CEILING))
+    p_in = p_after_anchor
+    if p_in <= 0.0 or p_in >= 1.0:
+        p_stretched = p_in
+    else:
+        pa = p_in ** a
+        q_a = (1.0 - p_in) ** a
+        denominator = pa + q_a
+        if denominator == 0.0:
+            p_stretched = p_in
+        else:
+            p_stretched = pa / denominator
 
     logger.debug(
-        "calibrate: raw=%.4f corroborating=%d shrinkage=%.4f "
-        "shrunk=%.4f stretched=%.4f result=%.4f",
-        raw_prob, corroborating, shrinkage, shrunk, stretched, result,
+        "Stage 2 stretch: signals=%d a=%.4f p %.4f -> %.4f",
+        num_corroborating_signals,
+        a,
+        p_in,
+        p_stretched,
     )
 
-    return result
+    # ------------------------------------------------------------------ #
+    # Stage 3 – Extremity Guard                                           #
+    # ------------------------------------------------------------------ #
+    p_final = max(0.05, min(0.95, p_stretched))
 
-
-def calibrate_batch(raw_probs: np.ndarray, signals_list: list = None) -> np.ndarray:
-    if signals_list is None:
-        signals_list = [{} for _ in raw_probs]
-
-    results = np.array([
-        calibrate(p, s) for p, s in zip(raw_probs, signals_list)
-    ])
-    return results
-
-
-def compute_separation(calibrated_probs: np.ndarray, outcomes: np.ndarray) -> float:
-    calibrated_probs = np.asarray(calibrated_probs, dtype=float)
-    outcomes = np.asarray(outcomes, dtype=float)
-
-    if len(calibrated_probs) == 0 or len(outcomes) == 0:
-        return 0.0
-
-    win_mask = outcomes == 1
-    loss_mask = outcomes == 0
-
-    if win_mask.sum() == 0 or loss_mask.sum() == 0:
-        return 0.0
-
-    mean_win_prob = calibrated_probs[win_mask].mean()
-    mean_loss_prob = calibrated_probs[loss_mask].mean()
-    separation = float(mean_win_prob - mean_loss_prob)
-
-    logger.info(
-        "separation: %.4f (win_mean=%.4f, loss_mean=%.4f, n_wins=%d, n_losses=%d)",
-        separation, mean_win_prob, mean_loss_prob, win_mask.sum(), loss_mask.sum(),
+    logger.debug(
+        "Stage 3 guard: p %.4f -> %.4f (clamped=%s)",
+        p_stretched,
+        p_final,
+        p_final != p_stretched,
     )
 
-    return separation
-
-
-def rl_deployment_gate(
-    calibrated_probs: np.ndarray,
-    outcomes: np.ndarray,
-    min_separation: float = SEPARATION_THRESHOLD,
-) -> bool:
-    if len(calibrated_probs) < 10:
-        logger.warning(
-            "rl_deployment_gate: insufficient samples (%d), requiring at least 10",
-            len(calibrated_probs),
-        )
-        return False
-
-    separation = compute_separation(calibrated_probs, outcomes)
-    passes = separation >= min_separation
-
-    logger.info(
-        "rl_deployment_gate: separation=%.4f threshold=%.4f passes=%s",
-        separation, min_separation, passes,
-    )
-
-    return passes
-
-
-def apply_floor_ceiling(probs: np.ndarray) -> np.ndarray:
-    return np.clip(np.asarray(probs, dtype=float), FLOOR, CEILING)
-
-
-def calibration_summary(
-    raw_probs: np.ndarray,
-    calibrated_probs: np.ndarray,
-    outcomes: np.ndarray,
-) -> dict:
-    raw_probs = np.asarray(raw_probs, dtype=float)
-    calibrated_probs = np.asarray(calibrated_probs, dtype=float)
-    outcomes = np.asarray(outcomes, dtype=float)
-
-    separation = compute_separation(calibrated_probs, outcomes)
-    mean_deviation_raw = float(np.mean(np.abs(raw_probs - 0.5)))
-    mean_deviation_cal = float(np.mean(np.abs(calibrated_probs - 0.5)))
-
-    brier = float(np.mean((calibrated_probs - outcomes) ** 2)) if len(outcomes) > 0 else None
-
-    summary = {
-        "separation": separation,
-        "passes_gate": separation >= SEPARATION_THRESHOLD,
-        "mean_deviation_raw": mean_deviation_raw,
-        "mean_deviation_calibrated": mean_deviation_cal,
-        "amplification_ratio": (
-            mean_deviation_cal / mean_deviation_raw
-            if mean_deviation_raw > 0 else None
-        ),
-        "brier_score": brier,
-        "n_samples": len(calibrated_probs),
-        "shrinkage_base": SHRINKAGE_BASE,
-        "logistic_stretch_k": LOGISTIC_STRETCH_K,
-        "floor": FLOOR,
-        "ceiling": CEILING,
+    calibration_metadata: dict[str, Any] = {
+        "raw_probability": raw_probability,
+        "p_after_anchor": round(p_after_anchor, 6),
+        "p_after_stretch": round(p_stretched, 6),
+        "p_final": round(p_final, 6),
+        "stretch_factor_a": round(a, 4),
+        "num_corroborating_signals": num_corroborating_signals,
+        "base_rate_used": base_rate,
+        "base_rate_sample_size": base_rate_sample_size,
+        "anchor_weight": round(anchor_weight, 6),
+        "category": category,
+        "domain": domain,
+        "clamped": p_final != p_stretched,
     }
 
-    logger.info("calibration_summary: %s", summary)
-    return summary
+    return {
+        "probability": round(p_final, 6),
+        "calibration_metadata": calibration_metadata,
+    }
+
+
+def calibrate(
+    raw_probability: float,
+    context: dict[str, Any] | None = None,
+) -> float:
+    """
+    Thin convenience wrapper that accepts an optional context dict and returns
+    only the calibrated probability float.  Existing call-sites that pass a
+    single probability value continue to work without modification.
+    """
+    if context is None:
+        context = {}
+
+    result = calibrate_probability(
+        raw_probability=raw_probability,
+        category=context.get("category", ""),
+        domain=context.get("domain", ""),
+        num_corroborating_signals=int(context.get("num_corroborating_signals", 0)),
+        historical_rates=context.get("historical_rates", {}),
+    )
+    return result["probability"]
