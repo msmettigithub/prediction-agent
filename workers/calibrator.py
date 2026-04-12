@@ -1,118 +1,116 @@
-workers/calibrator.py
+import numpy as np
+from typing import Union, List
 import logging
-import math
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ALPHA = 1.8
-MAX_ALPHA = 2.5
-MIDDLE_BAND_LOW = 0.42
-MIDDLE_BAND_HIGH = 0.58
-MIN_SIGNALS_FOR_BAND_AVOIDANCE = 2
+DEFAULT_CONFIG = {
+    "blend_weight": 0.90,
+    "stretch_k": 1.5,
+    "prob_floor": 0.05,
+    "prob_ceiling": 0.95,
+    "use_geometric_mean": True,
+}
 
 
-def extremize(p: float, alpha: float = DEFAULT_ALPHA) -> float:
-    p = max(0.001, min(0.999, p))
-    pa = p ** alpha
-    one_minus_pa = (1.0 - p) ** alpha
-    result = pa / (pa + one_minus_pa)
-    logger.info(
-        f"CALIBRATOR extremize: raw={p:.4f} -> extremized={result:.4f} (alpha={alpha:.3f})"
-    )
-    return result
+def get_config_value(config: dict, key: str):
+    if config is None:
+        return DEFAULT_CONFIG[key]
+    return config.get(key, DEFAULT_CONFIG[key])
 
 
-def confidence_weight(num_signals: int, base_alpha: float = DEFAULT_ALPHA) -> float:
-    if num_signals <= 0:
-        return base_alpha
-    signal_bonus = math.log1p(num_signals) * 0.3
-    weighted = base_alpha + signal_bonus
-    capped = min(weighted, MAX_ALPHA)
-    logger.info(
-        f"CALIBRATOR confidence_weight: signals={num_signals} base_alpha={base_alpha:.3f} -> alpha={capped:.3f}"
-    )
-    return capped
+def stretch(p: float, k: float = 1.5) -> float:
+    pk = p ** k
+    one_minus_pk = (1.0 - p) ** k
+    denom = pk + one_minus_pk
+    if denom == 0:
+        return p
+    return pk / denom
 
 
-def apply_floor_ceiling(
-    p_extremized: float,
-    p_raw: float,
-    num_signals: int,
-) -> float:
-    in_middle_band = MIDDLE_BAND_LOW <= p_extremized <= MIDDLE_BAND_HIGH
-    if in_middle_band and num_signals >= MIN_SIGNALS_FOR_BAND_AVOIDANCE:
-        if p_raw >= 0.5:
-            adjusted = MIDDLE_BAND_HIGH + 0.001
-        else:
-            adjusted = MIDDLE_BAND_LOW - 0.001
-        adjusted = max(0.001, min(0.999, adjusted))
-        logger.info(
-            f"CALIBRATOR floor_ceiling: pushed {p_extremized:.4f} -> {adjusted:.4f} "
-            f"(signals={num_signals}, raw={p_raw:.4f})"
-        )
-        return adjusted
-    return p_extremized
+def apply_floor_ceiling(p: float, floor: float = 0.05, ceiling: float = 0.95) -> float:
+    return max(floor, min(ceiling, p))
+
+
+def blend_with_prior(raw: float, weight: float, prior: float = 0.5) -> float:
+    return weight * raw + (1.0 - weight) * prior
+
+
+def geometric_mean(probabilities: List[float]) -> float:
+    if not probabilities:
+        raise ValueError("Cannot compute geometric mean of empty list")
+    log_sum = sum(np.log(p) for p in probabilities)
+    return np.exp(log_sum / len(probabilities))
+
+
+def arithmetic_mean(probabilities: List[float]) -> float:
+    if not probabilities:
+        raise ValueError("Cannot compute arithmetic mean of empty list")
+    return sum(probabilities) / len(probabilities)
+
+
+def ensemble_average(probabilities: List[float], use_geometric: bool = True) -> float:
+    if len(probabilities) == 1:
+        return probabilities[0]
+    if use_geometric:
+        return geometric_mean(probabilities)
+    return arithmetic_mean(probabilities)
 
 
 def calibrate(
-    probability_dict: dict,
-    num_signals: int = 0,
-    backtest_alpha: float = None,
-) -> dict:
-    result = dict(probability_dict)
-
-    raw_prob = result.get("probability", result.get("p", result.get("raw_probability")))
-    if raw_prob is None:
-        logger.warning("CALIBRATOR: no probability key found in dict, returning unchanged")
-        return result
-
-    raw_prob = float(raw_prob)
-    raw_prob = max(0.001, min(0.999, raw_prob))
-
-    if backtest_alpha is not None:
-        alpha = float(backtest_alpha)
-        logger.info(f"CALIBRATOR: using backtest_alpha={alpha:.3f}")
-    else:
-        alpha = confidence_weight(num_signals, DEFAULT_ALPHA)
-
-    p_extremized = extremize(raw_prob, alpha)
-    p_final = apply_floor_ceiling(p_extremized, raw_prob, num_signals)
-
-    result["probability"] = p_final
-    result["p"] = p_final
-    result["raw_probability"] = raw_prob
-    result["extremized_probability"] = p_extremized
-    result["calibration_alpha"] = alpha
-    result["calibration_num_signals"] = num_signals
-    result["separation"] = abs(p_final - 0.5)
-
-    logger.info(
-        f"CALIBRATOR final: raw={raw_prob:.4f} extremized={p_extremized:.4f} "
-        f"final={p_final:.4f} separation={result['separation']:.4f} alpha={alpha:.3f}"
-    )
-
-    return result
-
-
-def calibrate_scalar(
-    p: float,
-    num_signals: int = 0,
-    backtest_alpha: float = None,
+    raw_prob: Union[float, List[float]],
+    config: dict = None,
 ) -> float:
-    result = calibrate(
-        {"probability": p},
-        num_signals=num_signals,
-        backtest_alpha=backtest_alpha,
+    blend_weight = get_config_value(config, "blend_weight")
+    stretch_k = get_config_value(config, "stretch_k")
+    prob_floor = get_config_value(config, "prob_floor")
+    prob_ceiling = get_config_value(config, "prob_ceiling")
+    use_geometric_mean = get_config_value(config, "use_geometric_mean")
+
+    if isinstance(raw_prob, (list, tuple, np.ndarray)):
+        probs = [float(p) for p in raw_prob]
+        probs = [apply_floor_ceiling(p, prob_floor, prob_ceiling) for p in probs]
+        p = ensemble_average(probs, use_geometric=use_geometric_mean)
+    else:
+        p = float(raw_prob)
+
+    p = apply_floor_ceiling(p, prob_floor, prob_ceiling)
+
+    p_blended = blend_with_prior(p, weight=blend_weight, prior=0.5)
+
+    p_stretched = stretch(p_blended, k=stretch_k)
+
+    p_final = apply_floor_ceiling(p_stretched, prob_floor, prob_ceiling)
+
+    logger.debug(
+        "calibrate: raw=%.4f blended=%.4f stretched=%.4f final=%.4f "
+        "(blend_weight=%.2f, k=%.2f)",
+        p, p_blended, p_stretched, p_final, blend_weight, stretch_k,
     )
-    return result["probability"]
+
+    return p_final
 
 
 def calibrate_batch(
-    probs: list,
-    num_signals: int = 0,
-    backtest_alpha: float = None,
-) -> list:
-    return [
-        calibrate_scalar(p, num_signals=num_signals, backtest_alpha=backtest_alpha)
-        for p in probs
-    ]
+    raw_probs: List[float],
+    config: dict = None,
+) -> List[float]:
+    return [calibrate(p, config=config) for p in raw_probs]
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+    test_cases = [0.38, 0.50, 0.62, 0.70, 0.30]
+    print("Single probability calibration:")
+    for raw in test_cases:
+        cal = calibrate(raw)
+        print(f"  raw={raw:.2f} -> calibrated={cal:.4f}")
+
+    print("\nEnsemble calibration (geometric mean):")
+    ensemble_input = [0.60, 0.64, 0.58]
+    cal_ensemble = calibrate(ensemble_input)
+    print(f"  inputs={ensemble_input} -> calibrated={cal_ensemble:.4f}")
+
+    print("\nEnsemble calibration (arithmetic mean):")
+    cal_arith = calibrate(ensemble_input, config={"use_geometric_mean": False})
+    print(f"  inputs={ensemble_input} -> calibrated={cal_arith:.4f}")
