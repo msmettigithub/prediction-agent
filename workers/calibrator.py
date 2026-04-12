@@ -1,97 +1,118 @@
+workers/calibrator.py
 import logging
 import math
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_ALPHA = 1.8
+MAX_ALPHA = 2.5
+MIDDLE_BAND_LOW = 0.42
+MIDDLE_BAND_HIGH = 0.58
+MIN_SIGNALS_FOR_BAND_AVOIDANCE = 2
 
-def extremize(p, a=1.5):
-    """
-    Apply extremizing transform: p_out = p^a / (p^a + (1-p)^a)
 
-    Monotonic and symmetric around 0.5. Pushes probabilities away from 0.5,
-    increasing separation while preserving rank ordering.
-
-    Args:
-        p: Input probability in [0, 1]
-        a: Exponent parameter controlling strength of extremization (default 1.5)
-
-    Returns:
-        Transformed probability clipped to [0.05, 0.95]
-    """
-    FLOOR = 0.05
-    CEILING = 0.95
-
-    if not (0.0 <= p <= 1.0):
-        logger.warning(f"extremize received out-of-range probability: {p}, clamping to [0,1]")
-        p = max(0.0, min(1.0, p))
-
-    if p <= 0.0:
-        return FLOOR
-    if p >= 1.0:
-        return CEILING
-
-    try:
-        p_a = p ** a
-        one_minus_p_a = (1.0 - p) ** a
-        denom = p_a + one_minus_p_a
-        if denom == 0.0:
-            logger.warning(f"extremize denominator is zero for p={p}, a={a}, returning p unchanged")
-            return p
-        result = p_a / denom
-    except (ValueError, ZeroDivisionError, OverflowError) as e:
-        logger.warning(f"extremize computation error for p={p}, a={a}: {e}, returning p unchanged")
-        return p
-
-    result = max(FLOOR, min(CEILING, result))
+def extremize(p: float, alpha: float = DEFAULT_ALPHA) -> float:
+    p = max(0.001, min(0.999, p))
+    pa = p ** alpha
+    one_minus_pa = (1.0 - p) ** alpha
+    result = pa / (pa + one_minus_pa)
+    logger.info(
+        f"CALIBRATOR extremize: raw={p:.4f} -> extremized={result:.4f} (alpha={alpha:.3f})"
+    )
     return result
 
 
-def calibrate(raw_prob, signal_count=1, signal_agreement=1.0, extremize_exponent=1.5):
-    """
-    Calibrate a raw probability and apply extremizing transform.
+def confidence_weight(num_signals: int, base_alpha: float = DEFAULT_ALPHA) -> float:
+    if num_signals <= 0:
+        return base_alpha
+    signal_bonus = math.log1p(num_signals) * 0.3
+    weighted = base_alpha + signal_bonus
+    capped = min(weighted, MAX_ALPHA)
+    logger.info(
+        f"CALIBRATOR confidence_weight: signals={num_signals} base_alpha={base_alpha:.3f} -> alpha={capped:.3f}"
+    )
+    return capped
 
-    Args:
-        raw_prob: Raw model probability in [0, 1]
-        signal_count: Number of signals (unused currently, reserved for future weighting)
-        signal_agreement: Float in [0, 1] representing fraction of signals in agreement
-        extremize_exponent: Exponent for extremization transform (default 1.5)
 
-    Returns:
-        Final calibrated and extremized probability
-    """
-    if not (0.0 <= raw_prob <= 1.0):
-        logger.warning(f"calibrate received out-of-range raw_prob: {raw_prob}, clamping")
-        raw_prob = max(0.0, min(1.0, raw_prob))
+def apply_floor_ceiling(
+    p_extremized: float,
+    p_raw: float,
+    num_signals: int,
+) -> float:
+    in_middle_band = MIDDLE_BAND_LOW <= p_extremized <= MIDDLE_BAND_HIGH
+    if in_middle_band and num_signals >= MIN_SIGNALS_FOR_BAND_AVOIDANCE:
+        if p_raw >= 0.5:
+            adjusted = MIDDLE_BAND_HIGH + 0.001
+        else:
+            adjusted = MIDDLE_BAND_LOW - 0.001
+        adjusted = max(0.001, min(0.999, adjusted))
+        logger.info(
+            f"CALIBRATOR floor_ceiling: pushed {p_extremized:.4f} -> {adjusted:.4f} "
+            f"(signals={num_signals}, raw={p_raw:.4f})"
+        )
+        return adjusted
+    return p_extremized
 
-    assert 0.0 <= raw_prob <= 1.0, f"Bad input to calibrate: {raw_prob}"
 
-    pre_extremize = raw_prob
+def calibrate(
+    probability_dict: dict,
+    num_signals: int = 0,
+    backtest_alpha: float = None,
+) -> dict:
+    result = dict(probability_dict)
 
-    a = extremize_exponent
-    post_extremize = extremize(pre_extremize, a=a)
+    raw_prob = result.get("probability", result.get("p", result.get("raw_probability")))
+    if raw_prob is None:
+        logger.warning("CALIBRATOR: no probability key found in dict, returning unchanged")
+        return result
+
+    raw_prob = float(raw_prob)
+    raw_prob = max(0.001, min(0.999, raw_prob))
+
+    if backtest_alpha is not None:
+        alpha = float(backtest_alpha)
+        logger.info(f"CALIBRATOR: using backtest_alpha={alpha:.3f}")
+    else:
+        alpha = confidence_weight(num_signals, DEFAULT_ALPHA)
+
+    p_extremized = extremize(raw_prob, alpha)
+    p_final = apply_floor_ceiling(p_extremized, raw_prob, num_signals)
+
+    result["probability"] = p_final
+    result["p"] = p_final
+    result["raw_probability"] = raw_prob
+    result["extremized_probability"] = p_extremized
+    result["calibration_alpha"] = alpha
+    result["calibration_num_signals"] = num_signals
+    result["separation"] = abs(p_final - 0.5)
 
     logger.info(
-        f"calibrate: raw={raw_prob:.4f} pre_extremize={pre_extremize:.4f} "
-        f"post_extremize={post_extremize:.4f} "
-        f"delta={post_extremize - pre_extremize:+.4f} "
-        f"a={a:.2f} signal_count={signal_count} signal_agreement={signal_agreement:.3f}"
+        f"CALIBRATOR final: raw={raw_prob:.4f} extremized={p_extremized:.4f} "
+        f"final={p_final:.4f} separation={result['separation']:.4f} alpha={alpha:.3f}"
     )
 
-    return post_extremize
+    return result
 
 
-def batch_calibrate(probabilities, extremize_exponent=1.5):
-    """
-    Calibrate a list of raw probabilities.
+def calibrate_scalar(
+    p: float,
+    num_signals: int = 0,
+    backtest_alpha: float = None,
+) -> float:
+    result = calibrate(
+        {"probability": p},
+        num_signals=num_signals,
+        backtest_alpha=backtest_alpha,
+    )
+    return result["probability"]
 
-    Args:
-        probabilities: List of raw probabilities
-        extremize_exponent: Exponent for extremization
 
-    Returns:
-        List of calibrated probabilities
-    """
-    results = []
-    for p in probabilities:
-        results.append(calibrate(p, extremize_exponent=extremize_exponent))
-    return results
+def calibrate_batch(
+    probs: list,
+    num_signals: int = 0,
+    backtest_alpha: float = None,
+) -> list:
+    return [
+        calibrate_scalar(p, num_signals=num_signals, backtest_alpha=backtest_alpha)
+        for p in probs
+    ]
