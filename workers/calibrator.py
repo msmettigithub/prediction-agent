@@ -1,168 +1,158 @@
-import logging
+workers/calibrator.py
+
 import math
+import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-try:
-    from config import EXTREMIZATION_ALPHA
-except ImportError:
-    EXTREMIZATION_ALPHA = 1.5
 
-CATEGORY_BASE_RATES = {
-    "geopolitical-status-quo": 0.7,
-    "financial-mean-reversion": 0.6,
-    "technology-adoption": 0.55,
-    "election-incumbent": 0.6,
-}
+def compute_signal_strength(
+    raw_p: float,
+    base_rate: Optional[float] = None,
+    trend_direction: Optional[float] = None,
+    sentiment_direction: Optional[float] = None,
+    market_movement: Optional[float] = None,
+) -> float:
+    """
+    Count how many signals agree with the raw probability direction (above/below 0.5).
+    Returns a value in [0, 1] representing fraction of available signals that corroborate.
+    """
+    direction = 1 if raw_p >= 0.5 else -1
+    corroborating = 0
+    total = 0
 
-DEFAULT_BASE_RATE = 0.5
-BASE_RATE_WEIGHT = 0.3
-MODEL_WEIGHT = 0.7
-CONFIDENCE_GATE_THRESHOLD = 0.05
-ALPHA_MIN = 1.2
-ALPHA_MAX = 2.0
+    if base_rate is not None:
+        total += 1
+        base_direction = 1 if base_rate >= 0.5 else -1
+        if base_direction == direction:
+            corroborating += 1
 
+    if trend_direction is not None:
+        total += 1
+        trend_dir = 1 if trend_direction >= 0 else -1
+        if trend_dir == direction:
+            corroborating += 1
 
-def _validate_alpha(a: float) -> float:
-    if not (ALPHA_MIN <= a <= ALPHA_MAX):
-        logger.warning(
-            "Extremization alpha %.3f out of valid range [%.1f, %.1f], clamping.",
-            a,
-            ALPHA_MIN,
-            ALPHA_MAX,
-        )
-        return max(ALPHA_MIN, min(ALPHA_MAX, a))
-    return a
+    if sentiment_direction is not None:
+        total += 1
+        sent_dir = 1 if sentiment_direction >= 0 else -1
+        if sent_dir == direction:
+            corroborating += 1
 
+    if market_movement is not None:
+        total += 1
+        mkt_dir = 1 if market_movement >= 0 else -1
+        if mkt_dir == direction:
+            corroborating += 1
 
-def _validate_probability(p: float, name: str = "probability") -> float:
-    if not (0.0 <= p <= 1.0):
-        logger.warning(
-            "Invalid %s value %.4f, clamping to [0, 1].", name, p
-        )
-        return max(0.0, min(1.0, p))
-    return p
-
-
-def get_base_rate(category: Optional[str]) -> float:
-    if category is None:
-        return DEFAULT_BASE_RATE
-    rate = CATEGORY_BASE_RATES.get(category, DEFAULT_BASE_RATE)
-    if category not in CATEGORY_BASE_RATES:
-        logger.debug(
-            "Category '%s' not found in base rate table, using default %.2f.",
-            category,
-            DEFAULT_BASE_RATE,
-        )
-    return rate
-
-
-def anchor_to_base_rate(p_model: float, category: Optional[str]) -> float:
-    p_model = _validate_probability(p_model, "model probability")
-    base_rate = get_base_rate(category)
-    p_anchored = BASE_RATE_WEIGHT * base_rate + MODEL_WEIGHT * p_model
-    p_anchored = _validate_probability(p_anchored, "anchored probability")
-    logger.debug(
-        "Base rate anchoring: category=%s base_rate=%.4f p_model=%.4f p_anchored=%.4f",
-        category,
-        base_rate,
-        p_model,
-        p_anchored,
-    )
-    return p_anchored
-
-
-def extremize(p: float, a: float) -> float:
-    p = _validate_probability(p, "pre-extremization probability")
-    a = _validate_alpha(a)
-    p_clipped = max(1e-9, min(1.0 - 1e-9, p))
-    p_a = math.pow(p_clipped, a)
-    one_minus_p_a = math.pow(1.0 - p_clipped, a)
-    denominator = p_a + one_minus_p_a
-    if denominator == 0.0:
-        logger.warning("Extremization denominator is zero for p=%.6f, a=%.3f, returning 0.5.", p, a)
+    if total == 0:
         return 0.5
-    p_ext = p_a / denominator
-    return _validate_probability(p_ext, "post-extremization probability")
+
+    return corroborating / total
 
 
 def calibrate(
-    p_model: float,
-    category: Optional[str] = None,
-    a: Optional[float] = None,
+    raw_p: float,
+    base_rate: Optional[float] = None,
+    trend_direction: Optional[float] = None,
+    sentiment_direction: Optional[float] = None,
+    market_movement: Optional[float] = None,
+    shrinkage_base: float = 0.3,
+    floor: float = 0.08,
+    ceiling: float = 0.92,
     contract_id: Optional[str] = None,
 ) -> float:
-    if a is None:
-        a = EXTREMIZATION_ALPHA
+    """
+    Calibrate a raw probability with signal-strength-dependent shrinkage.
 
-    a = _validate_alpha(a)
-    p_model = _validate_probability(p_model, "raw model probability")
+    Formula:
+        calibrated_p = 0.5 + (raw_p - 0.5) * (1 - shrinkage_base * (1 - signal_strength))
 
-    p_anchored = anchor_to_base_rate(p_model, category)
+    When all signals agree (signal_strength=1.0), shrinkage factor becomes 0 and raw_p stands.
+    When signals are mixed (signal_strength=0.0), shrinkage factor is shrinkage_base (~0.3).
 
-    distance_from_half = abs(p_anchored - 0.5)
-    if distance_from_half <= CONFIDENCE_GATE_THRESHOLD:
-        logger.info(
-            "Calibration [contract=%s category=%s]: "
-            "anchored probability %.4f is within %.2f of 0.5 (distance=%.4f), "
-            "skipping extremization to avoid amplifying noise. "
-            "p_raw=%.4f p_anchored=%.4f p_final=%.4f",
-            contract_id,
-            category,
-            p_anchored,
-            CONFIDENCE_GATE_THRESHOLD,
-            distance_from_half,
-            p_model,
-            p_anchored,
-            p_anchored,
-        )
-        return p_anchored
+    Output is clamped to [floor, ceiling] = [0.08, 0.92].
+    """
+    raw_p = max(0.0, min(1.0, raw_p))
 
-    p_extremized = extremize(p_anchored, a)
-
-    logger.info(
-        "Calibration [contract=%s category=%s]: "
-        "p_raw=%.4f p_anchored=%.4f p_extremized=%.4f "
-        "alpha=%.3f distance_from_half=%.4f extremization_applied=True",
-        contract_id,
-        category,
-        p_model,
-        p_anchored,
-        p_extremized,
-        a,
-        distance_from_half,
+    signal_strength = compute_signal_strength(
+        raw_p=raw_p,
+        base_rate=base_rate,
+        trend_direction=trend_direction,
+        sentiment_direction=sentiment_direction,
+        market_movement=market_movement,
     )
 
-    return p_extremized
+    effective_shrinkage = shrinkage_base * (1.0 - signal_strength)
+
+    calibrated_p = 0.5 + (raw_p - 0.5) * (1.0 - effective_shrinkage)
+
+    calibrated_p = max(floor, min(ceiling, calibrated_p))
+
+    label = contract_id if contract_id else "unknown"
+    logger.info(
+        "calibrator | contract=%s raw_p=%.4f signal_strength=%.4f "
+        "shrinkage_base=%.3f effective_shrinkage=%.4f calibrated_p=%.4f",
+        label,
+        raw_p,
+        signal_strength,
+        shrinkage_base,
+        effective_shrinkage,
+        calibrated_p,
+    )
+
+    return calibrated_p
 
 
-def calibrate_batch(
-    predictions: list,
-    a: Optional[float] = None,
-) -> list:
-    if a is None:
-        a = EXTREMIZATION_ALPHA
+def extremize(p: float, k: float = 1.7) -> float:
+    """
+    Logit-space sharpening transform. k=1.7 maps:
+      0.60 -> ~0.67, 0.65 -> ~0.74, 0.70 -> ~0.81
+    Use after calibrate() if additional separation is desired.
+    """
+    p = max(0.01, min(0.99, p))
+    logit = math.log(p / (1.0 - p))
+    sharpened_logit = logit * k
+    return 1.0 / (1.0 + math.exp(-sharpened_logit))
 
-    results = []
-    for item in predictions:
-        p_model = item.get("p_model")
-        category = item.get("category", None)
-        contract_id = item.get("contract_id", None)
 
-        if p_model is None:
-            logger.warning(
-                "Missing p_model in batch item contract_id=%s, skipping.", contract_id
-            )
-            results.append({**item, "p_calibrated": None, "error": "missing p_model"})
-            continue
+def calibrate_and_extremize(
+    raw_p: float,
+    base_rate: Optional[float] = None,
+    trend_direction: Optional[float] = None,
+    sentiment_direction: Optional[float] = None,
+    market_movement: Optional[float] = None,
+    shrinkage_base: float = 0.3,
+    floor: float = 0.08,
+    ceiling: float = 0.92,
+    extremize_k: float = 1.7,
+    contract_id: Optional[str] = None,
+) -> float:
+    """
+    Full pipeline: calibrate with signal-strength shrinkage, then extremize in logit space.
+    """
+    cal_p = calibrate(
+        raw_p=raw_p,
+        base_rate=base_rate,
+        trend_direction=trend_direction,
+        sentiment_direction=sentiment_direction,
+        market_movement=market_movement,
+        shrinkage_base=shrinkage_base,
+        floor=floor,
+        ceiling=ceiling,
+        contract_id=contract_id,
+    )
 
-        p_calibrated = calibrate(
-            p_model=p_model,
-            category=category,
-            a=a,
-            contract_id=contract_id,
-        )
-        results.append({**item, "p_calibrated": p_calibrated})
+    ext_p = extremize(cal_p, k=extremize_k)
 
-    return results
+    ext_p = max(floor, min(ceiling, ext_p))
+
+    logger.info(
+        "calibrator | contract=%s post_extremize_p=%.4f (k=%.2f)",
+        contract_id if contract_id else "unknown",
+        ext_p,
+        extremize_k,
+    )
+
+    return ext_p
