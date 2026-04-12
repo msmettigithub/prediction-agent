@@ -1,159 +1,209 @@
-import numpy as np
 import logging
+import math
+import numpy as np
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-try:
-    from config import CALIBRATION_STRETCH_FACTOR, CALIBRATION_ACCURACY_THRESHOLD
-except ImportError:
-    CALIBRATION_STRETCH_FACTOR = 1.35
-    CALIBRATION_ACCURACY_THRESHOLD = 0.70
+
+def evidence_strength(
+    base_rate: Optional[float] = None,
+    trend_momentum: Optional[float] = None,
+    sentiment_polarity: Optional[float] = None,
+    volume_signal: Optional[float] = None,
+) -> float:
+    """
+    Count corroborating signals and return a score in [0, 1].
+
+    Parameters
+    ----------
+    base_rate : float or None
+        Historical base rate probability (0-1). Divergence from 0.5 is a signal.
+    trend_momentum : float or None
+        Trend momentum value in [-1, 1]. Non-zero values are directional signals.
+    sentiment_polarity : float or None
+        Sentiment polarity in [-1, 1]. Non-zero values are directional signals.
+    volume_signal : float or None
+        Volume signal in [-1, 1]. Non-zero values indicate volume confirmation.
+
+    Returns
+    -------
+    float
+        Score in [0, 1] representing fraction of active signals that corroborate.
+    """
+    scores = []
+
+    if base_rate is not None:
+        divergence = abs(base_rate - 0.5) * 2.0
+        scores.append(min(1.0, divergence))
+
+    if trend_momentum is not None:
+        scores.append(min(1.0, abs(float(trend_momentum))))
+
+    if sentiment_polarity is not None:
+        scores.append(min(1.0, abs(float(sentiment_polarity))))
+
+    if volume_signal is not None:
+        scores.append(min(1.0, abs(float(volume_signal))))
+
+    if not scores:
+        return 0.5
+
+    return float(np.mean(scores))
 
 
-def sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+def _power_transform(p: float, gamma: float) -> float:
+    """
+    Apply power transform: p_cal = 0.5 + sign(p - 0.5) * |2p - 1|^gamma * 0.5
+
+    gamma < 1 stretches probabilities away from 0.5 (amplifies).
+    gamma > 1 shrinks probabilities toward 0.5 (dampens).
+    """
+    p = float(p)
+    sign = 1.0 if p >= 0.5 else -1.0
+    inner = abs(2.0 * p - 1.0)
+    transformed = 0.5 + sign * (inner ** gamma) * 0.5
+    return transformed
 
 
-def confidence_stretch(
+def calibrate(
     p: float,
-    stretch_factor: float = CALIBRATION_STRETCH_FACTOR,
+    base_rate: Optional[float] = None,
+    trend_momentum: Optional[float] = None,
+    sentiment_polarity: Optional[float] = None,
+    volume_signal: Optional[float] = None,
+    gamma_strong: float = 0.7,
+    gamma_weak: float = 1.3,
+    floor: float = 0.05,
+    ceiling: float = 0.95,
+    market_id: Optional[str] = None,
 ) -> float:
-    p_clipped = float(np.clip(p, 0.001, 0.999))
-    logit = np.log(p_clipped / (1.0 - p_clipped))
-    stretched_logit = logit * stretch_factor
-    p_new = float(sigmoid(np.array([stretched_logit]))[0])
-    return p_new
+    """
+    Calibrate a raw probability using evidence-weighted power transform.
 
+    When evidence_strength > 0.6, gamma < 1 is applied to stretch probabilities
+    away from 0.5 (signal convergence warrants more confidence).
 
-def calibrate_probability(
-    raw_prob: float,
-    base_model_accuracy: Optional[float] = None,
-    stretch_factor: float = CALIBRATION_STRETCH_FACTOR,
-    accuracy_threshold: float = CALIBRATION_ACCURACY_THRESHOLD,
-) -> float:
-    if not (0.0 <= raw_prob <= 1.0):
-        logger.warning(f"Raw probability {raw_prob} out of [0,1], clamping.")
-        raw_prob = float(np.clip(raw_prob, 0.0, 1.0))
+    When evidence_strength < 0.4, gamma > 1 is applied to shrink probabilities
+    toward 0.5 (weak evidence warrants less confidence).
 
-    p = float(np.clip(raw_prob, 0.001, 0.999))
+    Between 0.4 and 0.6, linear interpolation between the two gammas is used.
 
-    p = _apply_isotonic_adjustment(p)
-    p = _apply_temperature_scaling(p)
+    A floor/ceiling clamp at 0.05/0.95 prevents overconfidence.
 
-    pre_stretch = p
-    logger.debug(f"Pre-stretch probability: {pre_stretch:.6f}")
+    Parameters
+    ----------
+    p : float
+        Raw probability in [0, 1].
+    base_rate : float or None
+        Historical base rate probability for evidence scoring.
+    trend_momentum : float or None
+        Trend momentum signal for evidence scoring.
+    sentiment_polarity : float or None
+        Sentiment polarity signal for evidence scoring.
+    volume_signal : float or None
+        Volume signal for evidence scoring.
+    gamma_strong : float
+        Power transform gamma for strong evidence (< 1 stretches away from 0.5).
+    gamma_weak : float
+        Power transform gamma for weak evidence (> 1 shrinks toward 0.5).
+    floor : float
+        Minimum output probability (prevents overconfidence toward 0).
+    ceiling : float
+        Maximum output probability (prevents overconfidence toward 1).
+    market_id : str or None
+        Optional market identifier for logging.
 
-    should_stretch = True
-    if base_model_accuracy is not None:
-        if base_model_accuracy <= accuracy_threshold:
-            should_stretch = False
-            logger.info(
-                f"Skipping confidence stretch: base_model_accuracy={base_model_accuracy:.4f} "
-                f"<= threshold={accuracy_threshold:.4f}"
-            )
-        else:
-            logger.info(
-                f"Applying confidence stretch: base_model_accuracy={base_model_accuracy:.4f} "
-                f"> threshold={accuracy_threshold:.4f}"
-            )
+    Returns
+    -------
+    float
+        Calibrated probability clamped to [floor, ceiling].
+    """
+    p = float(p)
+    p_pre = max(0.0, min(1.0, p))
 
-    if should_stretch:
-        p = confidence_stretch(p, stretch_factor=stretch_factor)
-        post_stretch = p
-        logger.info(
-            f"Confidence stretch applied: pre={pre_stretch:.6f} -> post={post_stretch:.6f} "
-            f"(stretch_factor={stretch_factor}, delta={post_stretch - pre_stretch:+.6f})"
-        )
-        separation_pre = abs(pre_stretch - 0.5)
-        separation_post = abs(post_stretch - 0.5)
-        logger.info(
-            f"Separation from 0.5: pre={separation_pre:.6f} -> post={separation_post:.6f} "
-            f"(gain={separation_post - separation_pre:+.6f})"
-        )
-    else:
-        logger.debug(f"Confidence stretch skipped, probability unchanged: {p:.6f}")
-
-    p_final = float(np.clip(p, 0.05, 0.95))
-
-    if abs(p_final - p) > 1e-9:
-        logger.debug(f"Final clamp applied: {p:.6f} -> {p_final:.6f}")
-
-    logger.debug(
-        f"calibrate_probability complete: raw={raw_prob:.6f} -> final={p_final:.6f}"
+    ev_strength = evidence_strength(
+        base_rate=base_rate,
+        trend_momentum=trend_momentum,
+        sentiment_polarity=sentiment_polarity,
+        volume_signal=volume_signal,
     )
 
-    return p_final
+    if ev_strength > 0.6:
+        gamma = gamma_strong
+    elif ev_strength < 0.4:
+        gamma = gamma_weak
+    else:
+        t = (ev_strength - 0.4) / 0.2
+        gamma = gamma_weak + t * (gamma_strong - gamma_weak)
+
+    p_transformed = _power_transform(p_pre, gamma)
+
+    p_cal = max(floor, min(ceiling, p_transformed))
+
+    log_context = f"market={market_id} " if market_id else ""
+    logger.info(
+        "%sevidence_strength=%.4f gamma=%.4f p_raw=%.4f p_pre_clamp=%.4f p_cal=%.4f",
+        log_context,
+        ev_strength,
+        gamma,
+        p_pre,
+        p_transformed,
+        p_cal,
+    )
+
+    return p_cal
 
 
 def calibrate_batch(
-    raw_probs: list,
-    base_model_accuracy: Optional[float] = None,
-    stretch_factor: float = CALIBRATION_STRETCH_FACTOR,
-    accuracy_threshold: float = CALIBRATION_ACCURACY_THRESHOLD,
-) -> list:
-    if not raw_probs:
-        return []
+    probabilities,
+    base_rate: Optional[float] = None,
+    trend_momentum: Optional[float] = None,
+    sentiment_polarity: Optional[float] = None,
+    volume_signal: Optional[float] = None,
+    gamma_strong: float = 0.7,
+    gamma_weak: float = 1.3,
+    floor: float = 0.05,
+    ceiling: float = 0.95,
+    market_id: Optional[str] = None,
+):
+    """
+    Calibrate a list or array of raw probabilities.
 
-    calibrated = [
-        calibrate_probability(
-            p,
-            base_model_accuracy=base_model_accuracy,
-            stretch_factor=stretch_factor,
-            accuracy_threshold=accuracy_threshold,
+    Parameters
+    ----------
+    probabilities : iterable of float
+        Raw probabilities in [0, 1].
+    base_rate, trend_momentum, sentiment_polarity, volume_signal : float or None
+        Shared signals used for evidence scoring across all probabilities.
+    gamma_strong : float
+        Power transform gamma for strong evidence.
+    gamma_weak : float
+        Power transform gamma for weak evidence.
+    floor : float
+        Minimum output probability.
+    ceiling : float
+        Maximum output probability.
+    market_id : str or None
+        Optional market identifier for logging.
+
+    Returns
+    -------
+    list of float
+        Calibrated probabilities.
+    """
+    return [
+        calibrate(
+            p=p,
+            base_rate=base_rate,
+            trend_momentum=trend_momentum,
+            sentiment_polarity=sentiment_polarity,
+            volume_signal=volume_signal,
+            gamma_strong=gamma_strong,
+            gamma_weak=gamma_weak,
+            floor=floor,
+            ceiling=ceiling,
+            market_id=market_id,
         )
-        for p in raw_probs
+        for p in probabilities
     ]
-
-    separations = [abs(p - 0.5) for p in calibrated]
-    raw_separations = [abs(p - 0.5) for p in raw_probs]
-    logger.info(
-        f"Batch calibration summary: n={len(calibrated)}, "
-        f"mean_separation_raw={np.mean(raw_separations):.6f}, "
-        f"mean_separation_calibrated={np.mean(separations):.6f}, "
-        f"mean_calibrated_prob={np.mean(calibrated):.6f}, "
-        f"std_calibrated_prob={np.std(calibrated):.6f}"
-    )
-
-    return calibrated
-
-
-def _apply_isotonic_adjustment(p: float) -> float:
-    return p
-
-
-def _apply_temperature_scaling(p: float, temperature: float = 1.0) -> float:
-    if abs(temperature - 1.0) < 1e-9:
-        return p
-    p_clipped = float(np.clip(p, 0.001, 0.999))
-    logit = np.log(p_clipped / (1.0 - p_clipped))
-    scaled_logit = logit / temperature
-    return float(sigmoid(np.array([scaled_logit]))[0])
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
-    test_cases = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90,
-                  0.45, 0.40, 0.35, 0.30, 0.25, 0.20]
-
-    print(f"{'Raw':>8} {'Stretched':>12} {'Delta':>10} {'Sep_raw':>10} {'Sep_new':>10}")
-    print("-" * 55)
-    for raw in test_cases:
-        stretched = confidence_stretch(raw, stretch_factor=CALIBRATION_STRETCH_FACTOR)
-        delta = stretched - raw
-        sep_raw = abs(raw - 0.5)
-        sep_new = abs(stretched - 0.5)
-        print(f"{raw:>8.4f} {stretched:>12.6f} {delta:>+10.6f} {sep_raw:>10.6f} {sep_new:>10.6f}")
-
-    print()
-    print("Full calibration pipeline test (accuracy=0.804):")
-    for raw in [0.55, 0.60, 0.65, 0.70, 0.80]:
-        final = calibrate_probability(raw, base_model_accuracy=0.804)
-        print(f"  raw={raw:.2f} -> final={final:.6f}")
-
-    print()
-    print("Full calibration pipeline test (accuracy=0.65 - below threshold, no stretch):")
-    for raw in [0.55, 0.60, 0.65, 0.70, 0.80]:
-        final = calibrate_probability(raw, base_model_accuracy=0.65)
-        print(f"  raw={raw:.2f} -> final={final:.6f}")
