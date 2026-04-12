@@ -1,158 +1,133 @@
-workers/calibrator.py
-
 import math
 import logging
-from typing import Optional
+from workers.config import CALIBRATION_SHARPNESS
 
 logger = logging.getLogger(__name__)
 
 
-def compute_signal_strength(
-    raw_p: float,
-    base_rate: Optional[float] = None,
-    trend_direction: Optional[float] = None,
-    sentiment_direction: Optional[float] = None,
-    market_movement: Optional[float] = None,
-) -> float:
+def _logit(p: float) -> float:
+    return math.log(p / (1.0 - p))
+
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def calibrate(raw_prob: float, k: float = None) -> float:
     """
-    Count how many signals agree with the raw probability direction (above/below 0.5).
-    Returns a value in [0, 1] representing fraction of available signals that corroborate.
+    Calibrate a raw probability using a logit-space sharpening transform.
+
+    Steps:
+      1. Clamp raw_prob to (0.001, 0.999) for numerical safety.
+      2. Compute logit = ln(p / (1 - p)).
+      3. Multiply logit by sharpening factor k (default CALIBRATION_SHARPNESS).
+      4. Convert back via sigmoid: p_sharp = 1 / (1 + exp(-k * logit)).
+      5. Clamp result to [0.03, 0.97] to avoid extreme values.
+
+    Args:
+        raw_prob: Raw model probability in (0, 1).
+        k: Sharpening factor. Values > 1 push probabilities away from 0.5.
+           Defaults to CALIBRATION_SHARPNESS from config.
+
+    Returns:
+        Sharpened and clamped calibrated probability.
     """
-    direction = 1 if raw_p >= 0.5 else -1
-    corroborating = 0
-    total = 0
+    if k is None:
+        k = CALIBRATION_SHARPNESS
 
-    if base_rate is not None:
-        total += 1
-        base_direction = 1 if base_rate >= 0.5 else -1
-        if base_direction == direction:
-            corroborating += 1
+    # Step 1: clamp for numerical safety before logit
+    p = max(0.001, min(0.999, raw_prob))
 
-    if trend_direction is not None:
-        total += 1
-        trend_dir = 1 if trend_direction >= 0 else -1
-        if trend_dir == direction:
-            corroborating += 1
+    # Step 2: logit transform
+    logit_p = _logit(p)
 
-    if sentiment_direction is not None:
-        total += 1
-        sent_dir = 1 if sentiment_direction >= 0 else -1
-        if sent_dir == direction:
-            corroborating += 1
+    # Step 3: apply sharpening in logit space
+    sharpened_logit = k * logit_p
 
-    if market_movement is not None:
-        total += 1
-        mkt_dir = 1 if market_movement >= 0 else -1
-        if mkt_dir == direction:
-            corroborating += 1
+    # Step 4: convert back to probability space
+    p_sharp = _sigmoid(sharpened_logit)
 
-    if total == 0:
-        return 0.5
+    # Step 5: clamp to [0.03, 0.97]
+    p_sharp = max(0.03, min(0.97, p_sharp))
 
-    return corroborating / total
-
-
-def calibrate(
-    raw_p: float,
-    base_rate: Optional[float] = None,
-    trend_direction: Optional[float] = None,
-    sentiment_direction: Optional[float] = None,
-    market_movement: Optional[float] = None,
-    shrinkage_base: float = 0.3,
-    floor: float = 0.08,
-    ceiling: float = 0.92,
-    contract_id: Optional[str] = None,
-) -> float:
-    """
-    Calibrate a raw probability with signal-strength-dependent shrinkage.
-
-    Formula:
-        calibrated_p = 0.5 + (raw_p - 0.5) * (1 - shrinkage_base * (1 - signal_strength))
-
-    When all signals agree (signal_strength=1.0), shrinkage factor becomes 0 and raw_p stands.
-    When signals are mixed (signal_strength=0.0), shrinkage factor is shrinkage_base (~0.3).
-
-    Output is clamped to [floor, ceiling] = [0.08, 0.92].
-    """
-    raw_p = max(0.0, min(1.0, raw_p))
-
-    signal_strength = compute_signal_strength(
-        raw_p=raw_p,
-        base_rate=base_rate,
-        trend_direction=trend_direction,
-        sentiment_direction=sentiment_direction,
-        market_movement=market_movement,
+    # Step 6: log both raw and sharpened for monitoring
+    logger.debug(
+        "calibrate: raw_prob=%.6f logit=%.6f k=%.4f sharpened_logit=%.6f p_sharp=%.6f",
+        raw_prob,
+        logit_p,
+        k,
+        sharpened_logit,
+        p_sharp,
     )
 
-    effective_shrinkage = shrinkage_base * (1.0 - signal_strength)
-
-    calibrated_p = 0.5 + (raw_p - 0.5) * (1.0 - effective_shrinkage)
-
-    calibrated_p = max(floor, min(ceiling, calibrated_p))
-
-    label = contract_id if contract_id else "unknown"
-    logger.info(
-        "calibrator | contract=%s raw_p=%.4f signal_strength=%.4f "
-        "shrinkage_base=%.3f effective_shrinkage=%.4f calibrated_p=%.4f",
-        label,
-        raw_p,
-        signal_strength,
-        shrinkage_base,
-        effective_shrinkage,
-        calibrated_p,
-    )
-
-    return calibrated_p
+    return float(p_sharp)
 
 
-def extremize(p: float, k: float = 1.7) -> float:
+def batch_calibrate(probs: list, k: float = None) -> list:
     """
-    Logit-space sharpening transform. k=1.7 maps:
-      0.60 -> ~0.67, 0.65 -> ~0.74, 0.70 -> ~0.81
-    Use after calibrate() if additional separation is desired.
+    Calibrate a list of raw probabilities.
+
+    Args:
+        probs: List of raw probabilities in (0, 1).
+        k: Sharpening factor passed to calibrate(). Defaults to CALIBRATION_SHARPNESS.
+
+    Returns:
+        List of calibrated probabilities.
     """
-    p = max(0.01, min(0.99, p))
-    logit = math.log(p / (1.0 - p))
-    sharpened_logit = logit * k
-    return 1.0 / (1.0 + math.exp(-sharpened_logit))
+    if k is None:
+        k = CALIBRATION_SHARPNESS
 
-
-def calibrate_and_extremize(
-    raw_p: float,
-    base_rate: Optional[float] = None,
-    trend_direction: Optional[float] = None,
-    sentiment_direction: Optional[float] = None,
-    market_movement: Optional[float] = None,
-    shrinkage_base: float = 0.3,
-    floor: float = 0.08,
-    ceiling: float = 0.92,
-    extremize_k: float = 1.7,
-    contract_id: Optional[str] = None,
-) -> float:
-    """
-    Full pipeline: calibrate with signal-strength shrinkage, then extremize in logit space.
-    """
-    cal_p = calibrate(
-        raw_p=raw_p,
-        base_rate=base_rate,
-        trend_direction=trend_direction,
-        sentiment_direction=sentiment_direction,
-        market_movement=market_movement,
-        shrinkage_base=shrinkage_base,
-        floor=floor,
-        ceiling=ceiling,
-        contract_id=contract_id,
-    )
-
-    ext_p = extremize(cal_p, k=extremize_k)
-
-    ext_p = max(floor, min(ceiling, ext_p))
+    results = []
+    for raw_prob in probs:
+        results.append(calibrate(raw_prob, k=k))
 
     logger.info(
-        "calibrator | contract=%s post_extremize_p=%.4f (k=%.2f)",
-        contract_id if contract_id else "unknown",
-        ext_p,
-        extremize_k,
+        "batch_calibrate: processed %d probabilities with k=%.4f | "
+        "raw_mean=%.4f sharp_mean=%.4f | "
+        "raw_separation=%.4f sharp_separation=%.4f",
+        len(probs),
+        k,
+        sum(probs) / len(probs) if probs else 0.0,
+        sum(results) / len(results) if results else 0.0,
+        sum(abs(p - 0.5) for p in probs) / len(probs) if probs else 0.0,
+        sum(abs(p - 0.5) for p in results) / len(results) if results else 0.0,
     )
 
-    return ext_p
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Sanity checks (executed at import time in development; skipped silently in
+# production if assertions are disabled via -O flag).
+# ---------------------------------------------------------------------------
+
+def _run_sanity_checks() -> None:
+    _eps = 1e-5
+
+    # 0.5 must be a fixed point for any k
+    mid = calibrate(0.5, k=1.5)
+    assert abs(mid - 0.5) < _eps, f"0.5 must map to 0.5, got {mid}"
+
+    # Probabilities above 0.5 must be pushed higher
+    assert calibrate(0.7, k=1.5) > 0.7, "p=0.7 must be pushed up"
+    assert calibrate(0.65, k=1.5) > 0.65, "p=0.65 must be pushed up"
+
+    # Probabilities below 0.5 must be pushed lower
+    assert calibrate(0.3, k=1.5) < 0.3, "p=0.3 must be pushed down"
+    assert calibrate(0.35, k=1.5) < 0.35, "p=0.35 must be pushed down"
+
+    # Output must stay within clamped range
+    assert 0.03 <= calibrate(0.999, k=1.5) <= 0.97, "must stay in [0.03, 0.97]"
+    assert 0.03 <= calibrate(0.001, k=1.5) <= 0.97, "must stay in [0.03, 0.97]"
+
+    # k=1 should be a near-identity (modulo clamping at tails)
+    for p_test in [0.2, 0.4, 0.5, 0.6, 0.8]:
+        result = calibrate(p_test, k=1.0)
+        assert abs(result - max(0.03, min(0.97, p_test))) < _eps, (
+            f"k=1 identity failed at p={p_test}: got {result}"
+        )
+
+    logger.debug("calibrator sanity checks passed")
+
+
+_run_sanity_checks()
