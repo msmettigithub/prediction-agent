@@ -1,209 +1,131 @@
 import logging
 import math
-import numpy as np
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+try:
+    from config import EXTREMIZE_EXPONENT, BASE_RATE_BLEND_WEIGHT
+except ImportError:
+    EXTREMIZE_EXPONENT = 1.5
+    BASE_RATE_BLEND_WEIGHT = 0.2
 
-def evidence_strength(
-    base_rate: Optional[float] = None,
-    trend_momentum: Optional[float] = None,
-    sentiment_polarity: Optional[float] = None,
-    volume_signal: Optional[float] = None,
+CATEGORY_BASE_RATES: dict[str, float] = {
+    "crypto": 0.52,
+    "sports": 0.50,
+    "politics": 0.48,
+    "finance": 0.51,
+    "science": 0.50,
+    "weather": 0.53,
+    "entertainment": 0.50,
+    "technology": 0.51,
+    "default": 0.50,
+}
+
+CONFIDENCE_FLOOR = 0.03
+
+
+def extremize(p: float, a: Optional[float] = None) -> float:
+    if a is None:
+        a = EXTREMIZE_EXPONENT
+    if p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+    p_a = p ** a
+    complement_a = (1.0 - p) ** a
+    denom = p_a + complement_a
+    if denom == 0.0:
+        return p
+    return p_a / denom
+
+
+def get_base_rate(category: Optional[str]) -> float:
+    if category is None:
+        return CATEGORY_BASE_RATES["default"]
+    return CATEGORY_BASE_RATES.get(category.lower(), CATEGORY_BASE_RATES["default"])
+
+
+def apply_base_rate_anchoring(
+    model_prob: float,
+    category: Optional[str] = None,
+    blend_weight: Optional[float] = None,
 ) -> float:
-    """
-    Count corroborating signals and return a score in [0, 1].
-
-    Parameters
-    ----------
-    base_rate : float or None
-        Historical base rate probability (0-1). Divergence from 0.5 is a signal.
-    trend_momentum : float or None
-        Trend momentum value in [-1, 1]. Non-zero values are directional signals.
-    sentiment_polarity : float or None
-        Sentiment polarity in [-1, 1]. Non-zero values are directional signals.
-    volume_signal : float or None
-        Volume signal in [-1, 1]. Non-zero values indicate volume confirmation.
-
-    Returns
-    -------
-    float
-        Score in [0, 1] representing fraction of active signals that corroborate.
-    """
-    scores = []
-
-    if base_rate is not None:
-        divergence = abs(base_rate - 0.5) * 2.0
-        scores.append(min(1.0, divergence))
-
-    if trend_momentum is not None:
-        scores.append(min(1.0, abs(float(trend_momentum))))
-
-    if sentiment_polarity is not None:
-        scores.append(min(1.0, abs(float(sentiment_polarity))))
-
-    if volume_signal is not None:
-        scores.append(min(1.0, abs(float(volume_signal))))
-
-    if not scores:
-        return 0.5
-
-    return float(np.mean(scores))
-
-
-def _power_transform(p: float, gamma: float) -> float:
-    """
-    Apply power transform: p_cal = 0.5 + sign(p - 0.5) * |2p - 1|^gamma * 0.5
-
-    gamma < 1 stretches probabilities away from 0.5 (amplifies).
-    gamma > 1 shrinks probabilities toward 0.5 (dampens).
-    """
-    p = float(p)
-    sign = 1.0 if p >= 0.5 else -1.0
-    inner = abs(2.0 * p - 1.0)
-    transformed = 0.5 + sign * (inner ** gamma) * 0.5
-    return transformed
+    if blend_weight is None:
+        blend_weight = BASE_RATE_BLEND_WEIGHT
+    base_rate = get_base_rate(category)
+    blended = blend_weight * base_rate + (1.0 - blend_weight) * model_prob
+    logger.debug(
+        f"base_rate_anchoring: model_prob={model_prob:.4f} base_rate={base_rate:.4f} "
+        f"blend_weight={blend_weight:.2f} blended={blended:.4f} category={category}"
+    )
+    return blended
 
 
 def calibrate(
-    p: float,
-    base_rate: Optional[float] = None,
-    trend_momentum: Optional[float] = None,
-    sentiment_polarity: Optional[float] = None,
-    volume_signal: Optional[float] = None,
-    gamma_strong: float = 0.7,
-    gamma_weak: float = 1.3,
-    floor: float = 0.05,
-    ceiling: float = 0.95,
-    market_id: Optional[str] = None,
-) -> float:
-    """
-    Calibrate a raw probability using evidence-weighted power transform.
+    p_raw: float,
+    category: Optional[str] = None,
+    signal_count: Optional[int] = None,
+    exponent: Optional[float] = None,
+) -> Optional[float]:
+    p_raw = float(p_raw)
+    p_raw = max(1e-9, min(1.0 - 1e-9, p_raw))
 
-    When evidence_strength > 0.6, gamma < 1 is applied to stretch probabilities
-    away from 0.5 (signal convergence warrants more confidence).
+    logger.info(f"calibrate_input: p_raw={p_raw:.4f} category={category} signal_count={signal_count}")
 
-    When evidence_strength < 0.4, gamma > 1 is applied to shrink probabilities
-    toward 0.5 (weak evidence warrants less confidence).
+    p_anchored = apply_base_rate_anchoring(p_raw, category=category)
 
-    Between 0.4 and 0.6, linear interpolation between the two gammas is used.
+    a = exponent if exponent is not None else EXTREMIZE_EXPONENT
+    if signal_count is not None:
+        a = a + 0.1 * min(max(signal_count - 1, 0), 4)
 
-    A floor/ceiling clamp at 0.05/0.95 prevents overconfidence.
+    p_ext = extremize(p_anchored, a=a)
 
-    Parameters
-    ----------
-    p : float
-        Raw probability in [0, 1].
-    base_rate : float or None
-        Historical base rate probability for evidence scoring.
-    trend_momentum : float or None
-        Trend momentum signal for evidence scoring.
-    sentiment_polarity : float or None
-        Sentiment polarity signal for evidence scoring.
-    volume_signal : float or None
-        Volume signal for evidence scoring.
-    gamma_strong : float
-        Power transform gamma for strong evidence (< 1 stretches away from 0.5).
-    gamma_weak : float
-        Power transform gamma for weak evidence (> 1 shrinks toward 0.5).
-    floor : float
-        Minimum output probability (prevents overconfidence toward 0).
-    ceiling : float
-        Maximum output probability (prevents overconfidence toward 1).
-    market_id : str or None
-        Optional market identifier for logging.
-
-    Returns
-    -------
-    float
-        Calibrated probability clamped to [floor, ceiling].
-    """
-    p = float(p)
-    p_pre = max(0.0, min(1.0, p))
-
-    ev_strength = evidence_strength(
-        base_rate=base_rate,
-        trend_momentum=trend_momentum,
-        sentiment_polarity=sentiment_polarity,
-        volume_signal=volume_signal,
-    )
-
-    if ev_strength > 0.6:
-        gamma = gamma_strong
-    elif ev_strength < 0.4:
-        gamma = gamma_weak
-    else:
-        t = (ev_strength - 0.4) / 0.2
-        gamma = gamma_weak + t * (gamma_strong - gamma_weak)
-
-    p_transformed = _power_transform(p_pre, gamma)
-
-    p_cal = max(floor, min(ceiling, p_transformed))
-
-    log_context = f"market={market_id} " if market_id else ""
     logger.info(
-        "%sevidence_strength=%.4f gamma=%.4f p_raw=%.4f p_pre_clamp=%.4f p_cal=%.4f",
-        log_context,
-        ev_strength,
-        gamma,
-        p_pre,
-        p_transformed,
-        p_cal,
+        f"calibrate_transform: p_raw={p_raw:.4f} p_anchored={p_anchored:.4f} "
+        f"p_ext={p_ext:.4f} exponent={a:.3f} category={category}"
     )
 
-    return p_cal
-
-
-def calibrate_batch(
-    probabilities,
-    base_rate: Optional[float] = None,
-    trend_momentum: Optional[float] = None,
-    sentiment_polarity: Optional[float] = None,
-    volume_signal: Optional[float] = None,
-    gamma_strong: float = 0.7,
-    gamma_weak: float = 1.3,
-    floor: float = 0.05,
-    ceiling: float = 0.95,
-    market_id: Optional[str] = None,
-):
-    """
-    Calibrate a list or array of raw probabilities.
-
-    Parameters
-    ----------
-    probabilities : iterable of float
-        Raw probabilities in [0, 1].
-    base_rate, trend_momentum, sentiment_polarity, volume_signal : float or None
-        Shared signals used for evidence scoring across all probabilities.
-    gamma_strong : float
-        Power transform gamma for strong evidence.
-    gamma_weak : float
-        Power transform gamma for weak evidence.
-    floor : float
-        Minimum output probability.
-    ceiling : float
-        Maximum output probability.
-    market_id : str or None
-        Optional market identifier for logging.
-
-    Returns
-    -------
-    list of float
-        Calibrated probabilities.
-    """
-    return [
-        calibrate(
-            p=p,
-            base_rate=base_rate,
-            trend_momentum=trend_momentum,
-            sentiment_polarity=sentiment_polarity,
-            volume_signal=volume_signal,
-            gamma_strong=gamma_strong,
-            gamma_weak=gamma_weak,
-            floor=floor,
-            ceiling=ceiling,
-            market_id=market_id,
+    distance_from_half = abs(p_ext - 0.5)
+    if distance_from_half < CONFIDENCE_FLOOR:
+        logger.info(
+            f"calibrate_skip: p_ext={p_ext:.4f} distance_from_half={distance_from_half:.4f} "
+            f"below floor={CONFIDENCE_FLOOR} returning None"
         )
-        for p in probabilities
-    ]
+        return None
+
+    logger.info(
+        f"calibrate_output: p_ext={p_ext:.4f} distance_from_half={distance_from_half:.4f}"
+    )
+    return p_ext
+
+
+def batch_calibrate(
+    predictions: list[dict],
+    exponent: Optional[float] = None,
+) -> list[dict]:
+    results = []
+    for pred in predictions:
+        p_raw = pred.get("probability", pred.get("p_raw", 0.5))
+        category = pred.get("category", None)
+        signal_count = pred.get("signal_count", None)
+
+        p_cal = calibrate(
+            p_raw=p_raw,
+            category=category,
+            signal_count=signal_count,
+            exponent=exponent,
+        )
+
+        result = dict(pred)
+        result["p_calibrated"] = p_cal
+        result["skipped"] = p_cal is None
+        results.append(result)
+
+    deployed = sum(1 for r in results if not r["skipped"])
+    total = len(results)
+    logger.info(
+        f"batch_calibrate_summary: total={total} deployed={deployed} skipped={total - deployed} "
+        f"deploy_rate={deployed / total:.3f}" if total > 0 else "batch_calibrate_summary: total=0"
+    )
+    return results
