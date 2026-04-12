@@ -1,122 +1,78 @@
 import math
-import logging
-from typing import Optional
+from typing import Optional, Dict
+from config import EXTREMIZE_ALPHA
 
-logger = logging.getLogger(__name__)
+BASE_RATES: Dict[str, float] = {
+    "geopolitical_stability": 0.70,
+    "tech_earnings_beat": 0.65,
+    "policy_continuation": 0.60,
+}
 
-EXTREMIZE_K = 1.6
-CONFIDENCE_FLOOR = 0.03
-CLIP_LOW = 0.03
-CLIP_HIGH = 0.97
-
-
-def extremize(p: float, k: float = EXTREMIZE_K) -> float:
-    p = max(1e-9, min(1 - 1e-9, float(p)))
-    logit = math.log(p / (1.0 - p))
-    stretched = k * logit
-    result = 1.0 / (1.0 + math.exp(-stretched))
-    return max(CLIP_LOW, min(CLIP_HIGH, result))
+DEFAULT_BASE_RATE = 0.55
+BASE_RATE_MIXING_WEIGHT = 0.30
+MODEL_SIGNAL_WEIGHT = 0.70
+CONFIDENCE_THRESHOLD_LOW = 0.40
+CONFIDENCE_THRESHOLD_HIGH = 0.60
 
 
-def apply_extremize_if_confident(p: float, k: float = EXTREMIZE_K, floor: float = CONFIDENCE_FLOOR) -> float:
-    if abs(p - 0.5) > floor:
-        p_new = extremize(p, k)
-        logger.debug(
-            "extremize: before=%.4f after=%.4f delta=%.4f (k=%.2f)",
-            p, p_new, p_new - p, k,
-        )
-        return p_new
-    logger.debug("extremize: skipped p=%.4f (|p-0.5|=%.4f <= floor=%.4f)", p, abs(p - 0.5), floor)
+def extremize(p: float, alpha: float = EXTREMIZE_ALPHA) -> float:
+    eps = 1e-9
+    p = max(eps, min(1.0 - eps, p))
+    p_alpha = p ** alpha
+    one_minus_p_alpha = (1.0 - p) ** alpha
+    return p_alpha / (p_alpha + one_minus_p_alpha)
+
+
+def anchor_to_base_rate(p: float, category: Optional[str] = None) -> float:
+    base_rate = BASE_RATES.get(category, DEFAULT_BASE_RATE) if category else DEFAULT_BASE_RATE
+    anchored = MODEL_SIGNAL_WEIGHT * p + BASE_RATE_MIXING_WEIGHT * base_rate
+    return anchored
+
+
+def platt_scale(p: float, a: float = 1.0, b: float = 0.0) -> float:
+    eps = 1e-9
+    p = max(eps, min(1.0 - eps, p))
+    logit_p = math.log(p / (1.0 - p))
+    scaled_logit = a * logit_p + b
+    return 1.0 / (1.0 + math.exp(-scaled_logit))
+
+
+def calibrate(
+    raw_prob: float,
+    category: Optional[str] = None,
+    platt_a: float = 1.0,
+    platt_b: float = 0.0,
+    alpha: Optional[float] = None,
+) -> float:
+    if not (0.0 <= raw_prob <= 1.0):
+        raise ValueError(f"raw_prob must be in [0, 1], got {raw_prob}")
+
+    p = platt_scale(raw_prob, a=platt_a, b=platt_b)
+
+    p = anchor_to_base_rate(p, category=category)
+
+    if not (CONFIDENCE_THRESHOLD_LOW <= p <= CONFIDENCE_THRESHOLD_HIGH):
+        effective_alpha = alpha if alpha is not None else EXTREMIZE_ALPHA
+        p = extremize(p, alpha=effective_alpha)
+
+    p = max(1e-9, min(1.0 - 1e-9, p))
     return p
 
 
-class Calibrator:
-    def __init__(
-        self,
-        method: str = "platt",
-        extremize_k: float = EXTREMIZE_K,
-        confidence_floor: float = CONFIDENCE_FLOOR,
-    ):
-        self.method = method
-        self.extremize_k = extremize_k
-        self.confidence_floor = confidence_floor
-        self._platt_a: float = 1.0
-        self._platt_b: float = 0.0
-        self._isotonic = None
-        self._fitted = False
+def batch_calibrate(
+    raw_probs: list,
+    categories: Optional[list] = None,
+    platt_a: float = 1.0,
+    platt_b: float = 0.0,
+    alpha: Optional[float] = None,
+) -> list:
+    if categories is None:
+        categories = [None] * len(raw_probs)
 
-    def fit(self, raw_probs, labels):
-        import numpy as np
+    if len(categories) != len(raw_probs):
+        raise ValueError("raw_probs and categories must have the same length")
 
-        raw_probs = np.asarray(raw_probs, dtype=float)
-        labels = np.asarray(labels, dtype=float)
-
-        if self.method == "platt":
-            from scipy.special import expit, logit as sp_logit
-            from scipy.optimize import minimize
-
-            def neg_log_loss(params):
-                a, b = params
-                scores = sp_logit(np.clip(raw_probs, 1e-9, 1 - 1e-9))
-                p = expit(a * scores + b)
-                p = np.clip(p, 1e-9, 1 - 1e-9)
-                return -np.mean(labels * np.log(p) + (1 - labels) * np.log(1 - p))
-
-            result = minimize(neg_log_loss, [1.0, 0.0], method="Nelder-Mead")
-            self._platt_a, self._platt_b = result.x
-
-        elif self.method == "isotonic":
-            from sklearn.isotonic import IsotonicRegression
-
-            self._isotonic = IsotonicRegression(out_of_bounds="clip")
-            self._isotonic.fit(raw_probs, labels)
-
-        self._fitted = True
-        logger.info("Calibrator fitted: method=%s", self.method)
-
-    def calibrate(self, p: float) -> float:
-        raw_before = float(p)
-
-        if self._fitted:
-            if self.method == "platt":
-                from scipy.special import expit, logit as sp_logit
-
-                score = sp_logit(max(1e-9, min(1 - 1e-9, raw_before)))
-                p = float(expit(self._platt_a * score + self._platt_b))
-
-            elif self.method == "isotonic" and self._isotonic is not None:
-                import numpy as np
-
-                p = float(self._isotonic.predict([raw_before])[0])
-
-        mid_p = float(p)
-
-        final_p = apply_extremize_if_confident(mid_p, k=self.extremize_k, floor=self.confidence_floor)
-
-        logger.info(
-            "calibrate: raw_input=%.4f post_scaling=%.4f post_extremize=%.4f",
-            raw_before,
-            mid_p,
-            final_p,
-        )
-
-        return final_p
-
-    def calibrate_batch(self, probs):
-        return [self.calibrate(p) for p in probs]
-
-
-_default_calibrator: Optional[Calibrator] = None
-
-
-def get_default_calibrator() -> Calibrator:
-    global _default_calibrator
-    if _default_calibrator is None:
-        _default_calibrator = Calibrator()
-    return _default_calibrator
-
-
-def calibrate_probability(p: float, calibrator: Optional[Calibrator] = None) -> float:
-    if calibrator is None:
-        calibrator = get_default_calibrator()
-    return calibrator.calibrate(p)
+    return [
+        calibrate(p, category=cat, platt_a=platt_a, platt_b=platt_b, alpha=alpha)
+        for p, cat in zip(raw_probs, categories)
+    ]
