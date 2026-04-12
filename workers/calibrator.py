@@ -1,155 +1,97 @@
 import logging
-import numpy as np
-from config import EXTREMIZATION_EXPONENT, EXTREMIZATION_MIN_THRESHOLD, CONFIDENCE_FLOOR
+import math
 
 logger = logging.getLogger(__name__)
 
 
-def extremize(p: float, alpha: float = None) -> float:
+def extremize(p, a=1.5):
     """
-    Apply Satopaa 2014 extremizing transform:
-        p_ext = p^a / (p^a + (1-p)^a)
+    Apply extremizing transform: p_out = p^a / (p^a + (1-p)^a)
 
-    This is monotonic and preserves ordering. With a > 1, probabilities
-    are pushed away from 0.5, increasing separation on directional signals.
+    Monotonic and symmetric around 0.5. Pushes probabilities away from 0.5,
+    increasing separation while preserving rank ordering.
+
+    Args:
+        p: Input probability in [0, 1]
+        a: Exponent parameter controlling strength of extremization (default 1.5)
+
+    Returns:
+        Transformed probability clipped to [0.05, 0.95]
     """
-    if alpha is None:
-        alpha = EXTREMIZATION_EXPONENT
+    FLOOR = 0.05
+    CEILING = 0.95
 
-    p = float(np.clip(p, 1e-9, 1 - 1e-9))
-    pa = p ** alpha
-    one_minus_pa = (1.0 - p) ** alpha
-    p_ext = pa / (pa + one_minus_pa)
-    return float(p_ext)
+    if not (0.0 <= p <= 1.0):
+        logger.warning(f"extremize received out-of-range probability: {p}, clamping to [0,1]")
+        p = max(0.0, min(1.0, p))
+
+    if p <= 0.0:
+        return FLOOR
+    if p >= 1.0:
+        return CEILING
+
+    try:
+        p_a = p ** a
+        one_minus_p_a = (1.0 - p) ** a
+        denom = p_a + one_minus_p_a
+        if denom == 0.0:
+            logger.warning(f"extremize denominator is zero for p={p}, a={a}, returning p unchanged")
+            return p
+        result = p_a / denom
+    except (ValueError, ZeroDivisionError, OverflowError) as e:
+        logger.warning(f"extremize computation error for p={p}, a={a}: {e}, returning p unchanged")
+        return p
+
+    result = max(FLOOR, min(CEILING, result))
+    return result
 
 
-def apply_confidence_floor(p: float, floor: float = None) -> float:
+def calibrate(raw_prob, signal_count=1, signal_agreement=1.0, extremize_exponent=1.5):
     """
-    Clamp probability to [floor, 1-floor] to preserve hedging.
-    No probability is pushed to an extreme that eliminates uncertainty entirely.
+    Calibrate a raw probability and apply extremizing transform.
+
+    Args:
+        raw_prob: Raw model probability in [0, 1]
+        signal_count: Number of signals (unused currently, reserved for future weighting)
+        signal_agreement: Float in [0, 1] representing fraction of signals in agreement
+        extremize_exponent: Exponent for extremization transform (default 1.5)
+
+    Returns:
+        Final calibrated and extremized probability
     """
-    if floor is None:
-        floor = CONFIDENCE_FLOOR
-    return float(np.clip(p, floor, 1.0 - floor))
+    if not (0.0 <= raw_prob <= 1.0):
+        logger.warning(f"calibrate received out-of-range raw_prob: {raw_prob}, clamping")
+        raw_prob = max(0.0, min(1.0, raw_prob))
+
+    assert 0.0 <= raw_prob <= 1.0, f"Bad input to calibrate: {raw_prob}"
+
+    pre_extremize = raw_prob
+
+    a = extremize_exponent
+    post_extremize = extremize(pre_extremize, a=a)
+
+    logger.info(
+        f"calibrate: raw={raw_prob:.4f} pre_extremize={pre_extremize:.4f} "
+        f"post_extremize={post_extremize:.4f} "
+        f"delta={post_extremize - pre_extremize:+.4f} "
+        f"a={a:.2f} signal_count={signal_count} signal_agreement={signal_agreement:.3f}"
+    )
+
+    return post_extremize
 
 
-def calibrate(
-    raw_prob: float,
-    alpha: float = None,
-    min_threshold: float = None,
-    confidence_floor: float = None,
-) -> float:
+def batch_calibrate(probabilities, extremize_exponent=1.5):
     """
-    Full calibration pipeline with optional extremization.
+    Calibrate a list of raw probabilities.
 
-    Steps:
-      1. Clamp raw input to a safe range.
-      2. Apply any existing weak calibration logic (identity for now,
-         extensible).
-      3. If the signal is directional enough (|p - 0.5| > min_threshold),
-         apply extremization with exponent alpha.
-      4. Clamp result to [confidence_floor, 1 - confidence_floor].
-      5. Log pre- and post-extremization values for monitoring.
+    Args:
+        probabilities: List of raw probabilities
+        extremize_exponent: Exponent for extremization
 
-    Parameters
-    ----------
-    raw_prob : float
-        Raw model probability in [0, 1].
-    alpha : float, optional
-        Extremization exponent. Defaults to EXTREMIZATION_EXPONENT from config.
-    min_threshold : float, optional
-        Minimum |p - 0.5| required to trigger extremization.
-        Defaults to EXTREMIZATION_MIN_THRESHOLD from config.
-    confidence_floor : float, optional
-        Floor/ceiling for final clamped probability.
-        Defaults to CONFIDENCE_FLOOR from config.
-
-    Returns
-    -------
-    float
-        Calibrated (and possibly extremized) probability.
+    Returns:
+        List of calibrated probabilities
     """
-    if alpha is None:
-        alpha = EXTREMIZATION_EXPONENT
-    if min_threshold is None:
-        min_threshold = EXTREMIZATION_MIN_THRESHOLD
-    if confidence_floor is None:
-        confidence_floor = CONFIDENCE_FLOOR
-
-    # Step 1: safe clamp
-    p = float(np.clip(raw_prob, 1e-9, 1 - 1e-9))
-
-    # Step 2: existing calibration logic placeholder
-    # Replace or extend this block with isotonic regression, Platt scaling, etc.
-    p_calibrated = p  # currently identity; hook for future calibration
-
-    # Step 3: extremization (only when signal is meaningfully directional)
-    deviation = abs(p_calibrated - 0.5)
-    if deviation > min_threshold:
-        p_pre = p_calibrated
-        p_post = extremize(p_calibrated, alpha=alpha)
-        logger.info(
-            "[CALIBRATOR] extremize applied: "
-            "p_pre=%.6f  p_post=%.6f  alpha=%.4f  deviation=%.6f",
-            p_pre,
-            p_post,
-            alpha,
-            deviation,
-        )
-        p_calibrated = p_post
-    else:
-        logger.debug(
-            "[CALIBRATOR] extremize skipped (|p-0.5|=%.6f <= threshold=%.6f): p=%.6f",
-            deviation,
-            min_threshold,
-            p_calibrated,
-        )
-
-    # Step 4: confidence floor
-    p_final = apply_confidence_floor(p_calibrated, floor=confidence_floor)
-
-    if p_final != p_calibrated:
-        logger.debug(
-            "[CALIBRATOR] confidence_floor applied: p_before_floor=%.6f  p_final=%.6f  floor=%.4f",
-            p_calibrated,
-            p_final,
-            confidence_floor,
-        )
-
-    return p_final
-
-
-def calibrate_batch(
-    raw_probs: list,
-    alpha: float = None,
-    min_threshold: float = None,
-    confidence_floor: float = None,
-) -> list:
-    """
-    Convenience wrapper to calibrate a list of raw probabilities.
-
-    Parameters
-    ----------
-    raw_probs : list of float
-        Raw model probabilities.
-    alpha : float, optional
-        Extremization exponent.
-    min_threshold : float, optional
-        Minimum deviation from 0.5 to trigger extremization.
-    confidence_floor : float, optional
-        Probability floor/ceiling after extremization.
-
-    Returns
-    -------
-    list of float
-        Calibrated probabilities in the same order.
-    """
-    return [
-        calibrate(
-            p,
-            alpha=alpha,
-            min_threshold=min_threshold,
-            confidence_floor=confidence_floor,
-        )
-        for p in raw_probs
-    ]
+    results = []
+    for p in probabilities:
+        results.append(calibrate(p, extremize_exponent=extremize_exponent))
+    return results
