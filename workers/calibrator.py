@@ -1,116 +1,168 @@
-import numpy as np
-from typing import Union, List
 import logging
+import math
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CONFIG = {
-    "blend_weight": 0.90,
-    "stretch_k": 1.5,
-    "prob_floor": 0.05,
-    "prob_ceiling": 0.95,
-    "use_geometric_mean": True,
+try:
+    from config import EXTREMIZATION_ALPHA
+except ImportError:
+    EXTREMIZATION_ALPHA = 1.5
+
+CATEGORY_BASE_RATES = {
+    "geopolitical-status-quo": 0.7,
+    "financial-mean-reversion": 0.6,
+    "technology-adoption": 0.55,
+    "election-incumbent": 0.6,
 }
 
-
-def get_config_value(config: dict, key: str):
-    if config is None:
-        return DEFAULT_CONFIG[key]
-    return config.get(key, DEFAULT_CONFIG[key])
-
-
-def stretch(p: float, k: float = 1.5) -> float:
-    pk = p ** k
-    one_minus_pk = (1.0 - p) ** k
-    denom = pk + one_minus_pk
-    if denom == 0:
-        return p
-    return pk / denom
+DEFAULT_BASE_RATE = 0.5
+BASE_RATE_WEIGHT = 0.3
+MODEL_WEIGHT = 0.7
+CONFIDENCE_GATE_THRESHOLD = 0.05
+ALPHA_MIN = 1.2
+ALPHA_MAX = 2.0
 
 
-def apply_floor_ceiling(p: float, floor: float = 0.05, ceiling: float = 0.95) -> float:
-    return max(floor, min(ceiling, p))
+def _validate_alpha(a: float) -> float:
+    if not (ALPHA_MIN <= a <= ALPHA_MAX):
+        logger.warning(
+            "Extremization alpha %.3f out of valid range [%.1f, %.1f], clamping.",
+            a,
+            ALPHA_MIN,
+            ALPHA_MAX,
+        )
+        return max(ALPHA_MIN, min(ALPHA_MAX, a))
+    return a
 
 
-def blend_with_prior(raw: float, weight: float, prior: float = 0.5) -> float:
-    return weight * raw + (1.0 - weight) * prior
+def _validate_probability(p: float, name: str = "probability") -> float:
+    if not (0.0 <= p <= 1.0):
+        logger.warning(
+            "Invalid %s value %.4f, clamping to [0, 1].", name, p
+        )
+        return max(0.0, min(1.0, p))
+    return p
 
 
-def geometric_mean(probabilities: List[float]) -> float:
-    if not probabilities:
-        raise ValueError("Cannot compute geometric mean of empty list")
-    log_sum = sum(np.log(p) for p in probabilities)
-    return np.exp(log_sum / len(probabilities))
+def get_base_rate(category: Optional[str]) -> float:
+    if category is None:
+        return DEFAULT_BASE_RATE
+    rate = CATEGORY_BASE_RATES.get(category, DEFAULT_BASE_RATE)
+    if category not in CATEGORY_BASE_RATES:
+        logger.debug(
+            "Category '%s' not found in base rate table, using default %.2f.",
+            category,
+            DEFAULT_BASE_RATE,
+        )
+    return rate
 
 
-def arithmetic_mean(probabilities: List[float]) -> float:
-    if not probabilities:
-        raise ValueError("Cannot compute arithmetic mean of empty list")
-    return sum(probabilities) / len(probabilities)
+def anchor_to_base_rate(p_model: float, category: Optional[str]) -> float:
+    p_model = _validate_probability(p_model, "model probability")
+    base_rate = get_base_rate(category)
+    p_anchored = BASE_RATE_WEIGHT * base_rate + MODEL_WEIGHT * p_model
+    p_anchored = _validate_probability(p_anchored, "anchored probability")
+    logger.debug(
+        "Base rate anchoring: category=%s base_rate=%.4f p_model=%.4f p_anchored=%.4f",
+        category,
+        base_rate,
+        p_model,
+        p_anchored,
+    )
+    return p_anchored
 
 
-def ensemble_average(probabilities: List[float], use_geometric: bool = True) -> float:
-    if len(probabilities) == 1:
-        return probabilities[0]
-    if use_geometric:
-        return geometric_mean(probabilities)
-    return arithmetic_mean(probabilities)
+def extremize(p: float, a: float) -> float:
+    p = _validate_probability(p, "pre-extremization probability")
+    a = _validate_alpha(a)
+    p_clipped = max(1e-9, min(1.0 - 1e-9, p))
+    p_a = math.pow(p_clipped, a)
+    one_minus_p_a = math.pow(1.0 - p_clipped, a)
+    denominator = p_a + one_minus_p_a
+    if denominator == 0.0:
+        logger.warning("Extremization denominator is zero for p=%.6f, a=%.3f, returning 0.5.", p, a)
+        return 0.5
+    p_ext = p_a / denominator
+    return _validate_probability(p_ext, "post-extremization probability")
 
 
 def calibrate(
-    raw_prob: Union[float, List[float]],
-    config: dict = None,
+    p_model: float,
+    category: Optional[str] = None,
+    a: Optional[float] = None,
+    contract_id: Optional[str] = None,
 ) -> float:
-    blend_weight = get_config_value(config, "blend_weight")
-    stretch_k = get_config_value(config, "stretch_k")
-    prob_floor = get_config_value(config, "prob_floor")
-    prob_ceiling = get_config_value(config, "prob_ceiling")
-    use_geometric_mean = get_config_value(config, "use_geometric_mean")
+    if a is None:
+        a = EXTREMIZATION_ALPHA
 
-    if isinstance(raw_prob, (list, tuple, np.ndarray)):
-        probs = [float(p) for p in raw_prob]
-        probs = [apply_floor_ceiling(p, prob_floor, prob_ceiling) for p in probs]
-        p = ensemble_average(probs, use_geometric=use_geometric_mean)
-    else:
-        p = float(raw_prob)
+    a = _validate_alpha(a)
+    p_model = _validate_probability(p_model, "raw model probability")
 
-    p = apply_floor_ceiling(p, prob_floor, prob_ceiling)
+    p_anchored = anchor_to_base_rate(p_model, category)
 
-    p_blended = blend_with_prior(p, weight=blend_weight, prior=0.5)
+    distance_from_half = abs(p_anchored - 0.5)
+    if distance_from_half <= CONFIDENCE_GATE_THRESHOLD:
+        logger.info(
+            "Calibration [contract=%s category=%s]: "
+            "anchored probability %.4f is within %.2f of 0.5 (distance=%.4f), "
+            "skipping extremization to avoid amplifying noise. "
+            "p_raw=%.4f p_anchored=%.4f p_final=%.4f",
+            contract_id,
+            category,
+            p_anchored,
+            CONFIDENCE_GATE_THRESHOLD,
+            distance_from_half,
+            p_model,
+            p_anchored,
+            p_anchored,
+        )
+        return p_anchored
 
-    p_stretched = stretch(p_blended, k=stretch_k)
+    p_extremized = extremize(p_anchored, a)
 
-    p_final = apply_floor_ceiling(p_stretched, prob_floor, prob_ceiling)
-
-    logger.debug(
-        "calibrate: raw=%.4f blended=%.4f stretched=%.4f final=%.4f "
-        "(blend_weight=%.2f, k=%.2f)",
-        p, p_blended, p_stretched, p_final, blend_weight, stretch_k,
+    logger.info(
+        "Calibration [contract=%s category=%s]: "
+        "p_raw=%.4f p_anchored=%.4f p_extremized=%.4f "
+        "alpha=%.3f distance_from_half=%.4f extremization_applied=True",
+        contract_id,
+        category,
+        p_model,
+        p_anchored,
+        p_extremized,
+        a,
+        distance_from_half,
     )
 
-    return p_final
+    return p_extremized
 
 
 def calibrate_batch(
-    raw_probs: List[float],
-    config: dict = None,
-) -> List[float]:
-    return [calibrate(p, config=config) for p in raw_probs]
+    predictions: list,
+    a: Optional[float] = None,
+) -> list:
+    if a is None:
+        a = EXTREMIZATION_ALPHA
 
+    results = []
+    for item in predictions:
+        p_model = item.get("p_model")
+        category = item.get("category", None)
+        contract_id = item.get("contract_id", None)
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-    test_cases = [0.38, 0.50, 0.62, 0.70, 0.30]
-    print("Single probability calibration:")
-    for raw in test_cases:
-        cal = calibrate(raw)
-        print(f"  raw={raw:.2f} -> calibrated={cal:.4f}")
+        if p_model is None:
+            logger.warning(
+                "Missing p_model in batch item contract_id=%s, skipping.", contract_id
+            )
+            results.append({**item, "p_calibrated": None, "error": "missing p_model"})
+            continue
 
-    print("\nEnsemble calibration (geometric mean):")
-    ensemble_input = [0.60, 0.64, 0.58]
-    cal_ensemble = calibrate(ensemble_input)
-    print(f"  inputs={ensemble_input} -> calibrated={cal_ensemble:.4f}")
+        p_calibrated = calibrate(
+            p_model=p_model,
+            category=category,
+            a=a,
+            contract_id=contract_id,
+        )
+        results.append({**item, "p_calibrated": p_calibrated})
 
-    print("\nEnsemble calibration (arithmetic mean):")
-    cal_arith = calibrate(ensemble_input, config={"use_geometric_mean": False})
-    print(f"  inputs={ensemble_input} -> calibrated={cal_arith:.4f}")
+    return results
