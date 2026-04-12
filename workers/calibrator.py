@@ -1,118 +1,122 @@
 import math
+import logging
 from typing import Optional
 
+logger = logging.getLogger(__name__)
 
-def _logit(p: float) -> float:
-    p = max(1e-9, min(1 - 1e-9, p))
-    return math.log(p / (1.0 - p))
-
-
-def _sigmoid(x: float) -> float:
-    return 1.0 / (1.0 + math.exp(-x))
+EXTREMIZE_K = 1.6
+CONFIDENCE_FLOOR = 0.03
+CLIP_LOW = 0.03
+CLIP_HIGH = 0.97
 
 
-def _clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
+def extremize(p: float, k: float = EXTREMIZE_K) -> float:
+    p = max(1e-9, min(1 - 1e-9, float(p)))
+    logit = math.log(p / (1.0 - p))
+    stretched = k * logit
+    result = 1.0 / (1.0 + math.exp(-stretched))
+    return max(CLIP_LOW, min(CLIP_HIGH, result))
 
 
-def calibrate(
-    raw_p: float,
-    signal_agreement_count: Optional[int] = None,
-) -> float:
-    """
-    Calibrate a raw probability toward a well-separated output.
-
-    Parameters
-    ----------
-    raw_p : float
-        Raw probability in (0, 1).
-    signal_agreement_count : int or None
-        Number of independent signals (base_rate, trend, sentiment, volume)
-        that agree on the directional outcome.  When None or < 2 the original
-        conservative path is used.
-
-    Returns
-    -------
-    float
-        Calibrated probability, always in [0.08, 0.92].
-    """
-    raw_p = _clamp(float(raw_p), 1e-6, 1.0 - 1e-6)
-
-    # ------------------------------------------------------------------
-    # Path A – confidence expansion via logit-space stretch
-    # Requires at least 2 independent signals agreeing on direction.
-    # ------------------------------------------------------------------
-    if signal_agreement_count is not None and signal_agreement_count >= 2:
-        logit_raw = _logit(raw_p)
-
-        # expansion factor: 1 + 0.15 * clamp(signal_count - 1, 0, 3)
-        extra_signals = _clamp(signal_agreement_count - 1, 0, 3)
-        expansion = 1.0 + 0.15 * extra_signals
-
-        logit_adjusted = logit_raw * expansion
-        p_calibrated = _sigmoid(logit_adjusted)
-
-        # Asymmetric clipping: avoid catastrophic Brier penalties on surprises
-        return _clamp(p_calibrated, 0.08, 0.92)
-
-    # ------------------------------------------------------------------
-    # Path B – original conservative shrinkage (fallback)
-    # Pulls probabilities modestly toward 0.5 to avoid over-confidence
-    # when signal evidence is weak or absent.
-    # ------------------------------------------------------------------
-    shrinkage = 0.15  # blend 15 % toward 0.5
-    p_conservative = raw_p * (1.0 - shrinkage) + 0.5 * shrinkage
-    return _clamp(p_conservative, 0.08, 0.92)
+def apply_extremize_if_confident(p: float, k: float = EXTREMIZE_K, floor: float = CONFIDENCE_FLOOR) -> float:
+    if abs(p - 0.5) > floor:
+        p_new = extremize(p, k)
+        logger.debug(
+            "extremize: before=%.4f after=%.4f delta=%.4f (k=%.2f)",
+            p, p_new, p_new - p, k,
+        )
+        return p_new
+    logger.debug("extremize: skipped p=%.4f (|p-0.5|=%.4f <= floor=%.4f)", p, abs(p - 0.5), floor)
+    return p
 
 
-# ---------------------------------------------------------------------------
-# Convenience helpers
-# ---------------------------------------------------------------------------
+class Calibrator:
+    def __init__(
+        self,
+        method: str = "platt",
+        extremize_k: float = EXTREMIZE_K,
+        confidence_floor: float = CONFIDENCE_FLOOR,
+    ):
+        self.method = method
+        self.extremize_k = extremize_k
+        self.confidence_floor = confidence_floor
+        self._platt_a: float = 1.0
+        self._platt_b: float = 0.0
+        self._isotonic = None
+        self._fitted = False
 
-def count_signal_agreement(
-    base_rate: Optional[float] = None,
-    trend: Optional[float] = None,
-    sentiment: Optional[float] = None,
-    volume: Optional[float] = None,
-    threshold: float = 0.5,
-) -> int:
-    """
-    Count how many of the supplied signals agree that the outcome probability
-    is above *threshold* (i.e. lean YES) or all agree it is below (lean NO).
+    def fit(self, raw_probs, labels):
+        import numpy as np
 
-    Each signal should be a probability in [0, 1] or None if unavailable.
+        raw_probs = np.asarray(raw_probs, dtype=float)
+        labels = np.asarray(labels, dtype=float)
 
-    Returns the count of signals that agree on the *dominant* direction.
-    """
-    signals = [s for s in (base_rate, trend, sentiment, volume) if s is not None]
-    if not signals:
-        return 0
+        if self.method == "platt":
+            from scipy.special import expit, logit as sp_logit
+            from scipy.optimize import minimize
 
-    yes_votes = sum(1 for s in signals if s >= threshold)
-    no_votes = len(signals) - yes_votes
+            def neg_log_loss(params):
+                a, b = params
+                scores = sp_logit(np.clip(raw_probs, 1e-9, 1 - 1e-9))
+                p = expit(a * scores + b)
+                p = np.clip(p, 1e-9, 1 - 1e-9)
+                return -np.mean(labels * np.log(p) + (1 - labels) * np.log(1 - p))
 
-    # Agreement count = size of the majority bloc
-    return max(yes_votes, no_votes)
+            result = minimize(neg_log_loss, [1.0, 0.0], method="Nelder-Mead")
+            self._platt_a, self._platt_b = result.x
+
+        elif self.method == "isotonic":
+            from sklearn.isotonic import IsotonicRegression
+
+            self._isotonic = IsotonicRegression(out_of_bounds="clip")
+            self._isotonic.fit(raw_probs, labels)
+
+        self._fitted = True
+        logger.info("Calibrator fitted: method=%s", self.method)
+
+    def calibrate(self, p: float) -> float:
+        raw_before = float(p)
+
+        if self._fitted:
+            if self.method == "platt":
+                from scipy.special import expit, logit as sp_logit
+
+                score = sp_logit(max(1e-9, min(1 - 1e-9, raw_before)))
+                p = float(expit(self._platt_a * score + self._platt_b))
+
+            elif self.method == "isotonic" and self._isotonic is not None:
+                import numpy as np
+
+                p = float(self._isotonic.predict([raw_before])[0])
+
+        mid_p = float(p)
+
+        final_p = apply_extremize_if_confident(mid_p, k=self.extremize_k, floor=self.confidence_floor)
+
+        logger.info(
+            "calibrate: raw_input=%.4f post_scaling=%.4f post_extremize=%.4f",
+            raw_before,
+            mid_p,
+            final_p,
+        )
+
+        return final_p
+
+    def calibrate_batch(self, probs):
+        return [self.calibrate(p) for p in probs]
 
 
-def calibrate_with_signals(
-    raw_p: float,
-    base_rate: Optional[float] = None,
-    trend: Optional[float] = None,
-    sentiment: Optional[float] = None,
-    volume: Optional[float] = None,
-    threshold: float = 0.5,
-) -> float:
-    """
-    Full pipeline: count signal agreement then calibrate.
+_default_calibrator: Optional[Calibrator] = None
 
-    Parameters mirror calibrate() and count_signal_agreement().
-    """
-    count = count_signal_agreement(
-        base_rate=base_rate,
-        trend=trend,
-        sentiment=sentiment,
-        volume=volume,
-        threshold=threshold,
-    )
-    return calibrate(raw_p, signal_agreement_count=count)
+
+def get_default_calibrator() -> Calibrator:
+    global _default_calibrator
+    if _default_calibrator is None:
+        _default_calibrator = Calibrator()
+    return _default_calibrator
+
+
+def calibrate_probability(p: float, calibrator: Optional[Calibrator] = None) -> float:
+    if calibrator is None:
+        calibrator = get_default_calibrator()
+    return calibrator.calibrate(p)
