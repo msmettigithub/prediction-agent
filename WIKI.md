@@ -189,12 +189,12 @@ This chat -> Claude creates Saturn job to inject into agent_commands DB
 2026-04-07: Initial state - 51 seeded backtest contracts, Brier 0.168
 
 ## Current Live State (auto-updated)
-Last update: 2026-04-13 05:37 UTC
+Last update: 2026-04-13 06:11 UTC
 - gate: False
 - resolved: 0
 - pnl: 0
-- rl_rate: 0.1
-- cost: $10.89
+- rl_rate: 0.13
+- cost: $11.24
 ## Session Log
 - 2026-04-10 17:35: SESSION 2026-04-10: Major architecture rebuild.
 BALANCE: $3,378 (started $1,710, dipped to $1,362, recovered via settlements).
