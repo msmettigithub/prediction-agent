@@ -1,189 +1,126 @@
-import math
 import logging
+import math
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-try:
-    from config import EXTREMIZE_K, EXTREMIZE_ENABLED, EXTREMIZE_MIN_CONFIDENCE_DELTA
-except ImportError:
-    EXTREMIZE_K = 1.5
-    EXTREMIZE_ENABLED = True
-    EXTREMIZE_MIN_CONFIDENCE_DELTA = 0.03
+
+DEFAULT_EXTREMIZE_EXPONENT = 1.8
+MAX_EXTREMIZE_EXPONENT = 2.5
+DEFAULT_CONFIDENCE_FLOOR = 0.15
 
 
-def extremize(p: float, k: Optional[float] = None) -> float:
-    """
-    Apply log-odds sharpening (extremization) to a calibrated probability.
+def extremize(p: float, a: float = DEFAULT_EXTREMIZE_EXPONENT) -> float:
+    p = max(1e-9, min(1.0 - 1e-9, float(p)))
+    numerator = p ** a
+    denominator = numerator + (1.0 - p) ** a
+    if denominator == 0.0:
+        return p
+    return numerator / denominator
 
-    Steps:
-    1. Convert p to log-odds: logit = ln(p / (1-p))
-    2. Scale: scaled_logit = k * logit
-    3. Convert back: p_sharp = 1 / (1 + exp(-scaled_logit))
-    4. Clamp to [0.05, 0.95]
 
-    Only applies when |p - 0.5| > EXTREMIZE_MIN_CONFIDENCE_DELTA to avoid
-    amplifying noise on genuinely uncertain questions.
+def apply_confidence_floor(p: float, floor: float = DEFAULT_CONFIDENCE_FLOOR) -> float:
+    low = 0.5 - floor
+    high = 0.5 + floor
+    if low < p < high:
+        if p < 0.5:
+            return low
+        else:
+            return high
+    return p
 
-    Args:
-        p: Calibrated probability in (0, 1)
-        k: Sharpening factor. k > 1 pushes probabilities toward extremes.
-           Defaults to EXTREMIZE_K from config (recommended range: 1.2-2.0
-           per superforecasting literature).
 
-    Returns:
-        Sharpened probability clamped to [0.05, 0.95]
-    """
-    if k is None:
-        k = EXTREMIZE_K
+def compute_signal_agreement(signals: list) -> float:
+    if not signals or len(signals) < 2:
+        return 0.0
+    directions = []
+    for s in signals:
+        if s > 0.5:
+            directions.append(1)
+        elif s < 0.5:
+            directions.append(-1)
+        else:
+            directions.append(0)
+    non_neutral = [d for d in directions if d != 0]
+    if not non_neutral:
+        return 0.0
+    agreement = abs(sum(non_neutral)) / len(non_neutral)
+    return agreement
 
-    p = float(p)
 
-    # Safety clamp before logit to avoid log(0) or log(inf)
-    p = max(1e-9, min(1 - 1e-9, p))
+def compute_dynamic_exponent(
+    base_exponent: float,
+    signals: Optional[list],
+    max_exponent: float = MAX_EXTREMIZE_EXPONENT,
+) -> float:
+    if not signals or len(signals) < 2:
+        return base_exponent
+    agreement = compute_signal_agreement(signals)
+    exponent_range = max_exponent - base_exponent
+    dynamic_exponent = base_exponent + agreement * exponent_range
+    return min(dynamic_exponent, max_exponent)
 
-    # Only extremize when model has sufficient confidence signal
-    confidence_delta = abs(p - 0.5)
-    if confidence_delta <= EXTREMIZE_MIN_CONFIDENCE_DELTA:
+
+def calibrate(
+    raw_probability: float,
+    signals: Optional[list] = None,
+    base_exponent: float = DEFAULT_EXTREMIZE_EXPONENT,
+    confidence_floor: float = DEFAULT_CONFIDENCE_FLOOR,
+    max_exponent: float = MAX_EXTREMIZE_EXPONENT,
+) -> float:
+    pre_extremize = max(1e-9, min(1.0 - 1e-9, float(raw_probability)))
+
+    a = compute_dynamic_exponent(base_exponent, signals, max_exponent)
+
+    if signals and len(signals) >= 2:
         logger.debug(
-            "Skipping extremization: |p - 0.5| = %.4f <= threshold %.4f",
-            confidence_delta,
-            EXTREMIZE_MIN_CONFIDENCE_DELTA,
+            "Signal agreement computed",
+            extra={
+                "signals": signals,
+                "signal_count": len(signals),
+                "agreement": compute_signal_agreement(signals),
+                "dynamic_exponent": a,
+            },
         )
-        # Still clamp to [0.05, 0.95] for consistency
-        return max(0.05, min(0.95, p))
 
-    # Step 1: log-odds transform
-    logit = math.log(p / (1.0 - p))
-
-    # Step 2: apply sharpening factor
-    scaled_logit = k * logit
-
-    # Step 3: sigmoid back to probability
-    try:
-        p_sharp = 1.0 / (1.0 + math.exp(-scaled_logit))
-    except OverflowError:
-        # scaled_logit extremely negative => probability near 0
-        p_sharp = 0.0
-
-    # Step 4: clamp to [0.05, 0.95]
-    p_sharp = max(0.05, min(0.95, p_sharp))
-
-    logger.debug(
-        "Extremize: p=%.4f -> logit=%.4f -> scaled_logit=%.4f (k=%.2f) -> p_sharp=%.4f",
-        p,
-        logit,
-        scaled_logit,
-        k,
-        p_sharp,
-    )
-
-    return p_sharp
-
-
-def calibrate(raw_probability: float, market_context: Optional[dict] = None) -> float:
-    """
-    Full calibration pipeline for a raw model probability output.
-
-    Pipeline:
-    1. Input validation and clamping
-    2. (Existing calibration logic preserved here — add isotonic regression,
-       Platt scaling, or beta calibration upstream of this function as needed)
-    3. Extremization post-processing step (config-toggled)
-
-    Args:
-        raw_probability: Raw model output probability in [0, 1]
-        market_context: Optional dict with additional context (unused currently,
-                        reserved for future concordance-based signal fusion)
-
-    Returns:
-        Calibrated (and optionally extremized) probability in [0.05, 0.95]
-    """
-    p = float(raw_probability)
-
-    # Input validation
-    if not math.isfinite(p):
-        logger.warning("Non-finite probability received: %s, defaulting to 0.5", p)
-        p = 0.5
-
-    # Clamp raw input to valid probability range
-    p = max(0.0, min(1.0, p))
-
-    # ------------------------------------------------------------------
-    # Existing calibration logic (preserved)
-    # Insert isotonic regression / Platt scaling / beta calibration here.
-    # This function currently acts as a passthrough for the base probability
-    # and applies extremization as a post-processing layer below.
-    # ------------------------------------------------------------------
-    calibrated_p = p
-
-    # ------------------------------------------------------------------
-    # Extremization post-processing
-    # Toggle via EXTREMIZE_ENABLED in config.py
-    # Adjust sharpening strength via EXTREMIZE_K in config.py
-    # ------------------------------------------------------------------
-    if EXTREMIZE_ENABLED:
-        logger.debug(
-            "Applying extremization with k=%.2f, min_delta=%.3f",
-            EXTREMIZE_K,
-            EXTREMIZE_MIN_CONFIDENCE_DELTA,
-        )
-        final_p = extremize(calibrated_p, k=EXTREMIZE_K)
-    else:
-        logger.debug("Extremization disabled via config, returning calibrated_p=%.4f", calibrated_p)
-        final_p = max(0.05, min(0.95, calibrated_p))
+    post_extremize = extremize(pre_extremize, a)
+    final = apply_confidence_floor(post_extremize, confidence_floor)
 
     logger.info(
-        "Calibration complete: raw=%.4f -> calibrated=%.4f -> final=%.4f (extremize=%s, k=%.2f)",
-        raw_probability,
-        calibrated_p,
-        final_p,
-        EXTREMIZE_ENABLED,
-        EXTREMIZE_K,
+        "Calibration extremization applied",
+        extra={
+            "pre_extremize": pre_extremize,
+            "post_extremize": post_extremize,
+            "final_probability": final,
+            "exponent_used": a,
+            "confidence_floor": confidence_floor,
+            "floor_nudged": final != post_extremize,
+        },
     )
 
-    return final_p
+    return final
 
 
-def calibrate_batch(probabilities: list, market_contexts: Optional[list] = None) -> list:
-    """
-    Apply calibration pipeline to a batch of probabilities.
+def run(
+    raw_probability: float,
+    signals: Optional[list] = None,
+    exponent: float = DEFAULT_EXTREMIZE_EXPONENT,
+    confidence_floor: float = DEFAULT_CONFIDENCE_FLOOR,
+) -> dict:
+    final = calibrate(
+        raw_probability=raw_probability,
+        signals=signals,
+        base_exponent=exponent,
+        confidence_floor=confidence_floor,
+    )
 
-    Args:
-        probabilities: List of raw model output probabilities
-        market_contexts: Optional list of market context dicts, aligned with probabilities
+    result = {
+        "raw_probability": raw_probability,
+        "calibrated_probability": final,
+        "exponent": exponent,
+        "confidence_floor": confidence_floor,
+        "signals_used": signals if signals else [],
+    }
 
-    Returns:
-        List of calibrated probabilities
-    """
-    if market_contexts is None:
-        market_contexts = [None] * len(probabilities)
-
-    if len(market_contexts) != len(probabilities):
-        logger.warning(
-            "market_contexts length %d != probabilities length %d, ignoring contexts",
-            len(market_contexts),
-            len(probabilities),
-        )
-        market_contexts = [None] * len(probabilities)
-
-    results = []
-    for i, (p, ctx) in enumerate(zip(probabilities, market_contexts)):
-        try:
-            calibrated = calibrate(p, market_context=ctx)
-            results.append(calibrated)
-        except Exception as exc:
-            logger.error(
-                "Calibration failed for probability[%d]=%.4f: %s, using passthrough",
-                i,
-                float(p) if p is not None else float("nan"),
-                exc,
-            )
-            # Safe fallback: clamp raw value, no extremization
-            try:
-                fallback = max(0.05, min(0.95, float(p)))
-            except (TypeError, ValueError):
-                fallback = 0.5
-            results.append(fallback)
-
-    return results
+    logger.info("Calibrator worker run complete", extra=result)
+    return result
