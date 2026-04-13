@@ -1,82 +1,101 @@
 import logging
-import numpy as np
-from config import CALIBRATION_ALPHA, CALIBRATION_MIN_DISTANCE, RL_DEPLOY_RATE
+import math
 
 logger = logging.getLogger(__name__)
 
 
-def extremize(p: float, alpha: float = None) -> float:
-    if alpha is None:
-        alpha = CALIBRATION_ALPHA
-    p = float(np.clip(p, 1e-9, 1 - 1e-9))
-    p_alpha = p ** alpha
-    one_minus_alpha = (1.0 - p) ** alpha
-    return p_alpha / (p_alpha + one_minus_alpha)
+def count_signals(signals: dict) -> int:
+    count = 0
+    if signals.get("base_rate") is not None:
+        count += 1
+    if signals.get("trend") is not None:
+        count += 1
+    if signals.get("sentiment") is not None:
+        count += 1
+    if signals.get("market_data") is not None:
+        count += 1
+    return count
 
 
-def calibrate(p_raw: float, alpha: float = None, min_distance: float = None) -> dict:
-    if alpha is None:
-        alpha = CALIBRATION_ALPHA
-    if min_distance is None:
-        min_distance = CALIBRATION_MIN_DISTANCE
+def extremize(p: float, a: float) -> float:
+    if abs(p - 0.5) <= 0.03:
+        return p
+    pa = p ** a
+    one_minus_pa = (1.0 - p) ** a
+    denom = pa + one_minus_pa
+    if denom == 0:
+        return p
+    return pa / denom
 
-    p_raw = float(np.clip(p_raw, 1e-9, 1 - 1e-9))
 
-    distance_from_center = abs(p_raw - 0.5)
-    if distance_from_center < min_distance:
-        logger.info(
-            f"[calibrator] SKIP: raw={p_raw:.4f} |p-0.5|={distance_from_center:.4f} < threshold={min_distance:.4f}"
-        )
-        return {
-            "skip": True,
-            "reason": "too_uncertain",
-            "p_raw": p_raw,
-            "p_final": None,
-            "distance_from_center": distance_from_center,
-        }
+def clamp(p: float, floor: float = 0.08, ceiling: float = 0.92) -> float:
+    return max(floor, min(ceiling, p))
 
-    p_ext = extremize(p_raw, alpha=alpha)
 
-    p_final = float(np.clip(p_ext, 0.05, 0.95))
+def calibrate(raw_prob: float, signals: dict = None) -> float:
+    if signals is None:
+        signals = {}
+
+    signal_count = count_signals(signals)
+    a = 1.0 + 0.3 * min(signal_count, 5)
+
+    p_raw = float(raw_prob)
+    p_extremized = extremize(p_raw, a)
+    p_final = clamp(p_extremized)
 
     logger.info(
-        f"[calibrator] raw={p_raw:.4f} extremized={p_ext:.4f} final={p_final:.4f} "
-        f"alpha={alpha:.3f} |p-0.5|={distance_from_center:.4f}"
+        "calibrate: signal_count=%d extremizing_factor=%.3f "
+        "p_raw=%.4f p_extremized=%.4f p_final=%.4f "
+        "deviation_from_half=%.4f threshold_active=%s",
+        signal_count,
+        a,
+        p_raw,
+        p_extremized,
+        p_final,
+        abs(p_raw - 0.5),
+        abs(p_raw - 0.5) > 0.03,
     )
 
-    return {
-        "skip": False,
+    return p_final
+
+
+def calibrate_with_history(raw_prob: float, signals: dict = None, question_id: str = None) -> dict:
+    if signals is None:
+        signals = {}
+
+    signal_count = count_signals(signals)
+    a = 1.0 + 0.3 * min(signal_count, 5)
+
+    p_raw = float(raw_prob)
+    deviation = abs(p_raw - 0.5)
+    threshold_active = deviation > 0.03
+
+    p_extremized = extremize(p_raw, a)
+    p_final = clamp(p_extremized)
+
+    result = {
+        "probability": p_final,
         "p_raw": p_raw,
-        "p_extremized": p_ext,
+        "p_extremized": p_extremized,
         "p_final": p_final,
-        "alpha": alpha,
-        "distance_from_center": distance_from_center,
-        "rl_tracking": {
-            "before": p_raw,
-            "after": p_final,
-            "delta": p_final - p_raw,
-            "alpha_used": alpha,
-        },
+        "extremizing_factor": a,
+        "signal_count": signal_count,
+        "deviation_from_half": deviation,
+        "threshold_active": threshold_active,
+        "question_id": question_id,
     }
 
-
-def should_deploy(deploy_rate: float = None) -> bool:
-    if deploy_rate is None:
-        deploy_rate = RL_DEPLOY_RATE
-    return float(np.random.random()) < deploy_rate
-
-
-def run_calibration_pipeline(p_raw: float) -> dict:
-    result = calibrate(p_raw)
-
-    if result["skip"]:
-        return result
-
-    result["deploy"] = should_deploy()
-
     logger.info(
-        f"[calibrator] pipeline complete: p_raw={p_raw:.4f} "
-        f"p_final={result['p_final']:.4f} deploy={result['deploy']}"
+        "calibrate_with_history: question_id=%s signal_count=%d "
+        "extremizing_factor=%.3f p_raw=%.4f p_extremized=%.4f "
+        "p_final=%.4f rl_feedback=%s",
+        question_id,
+        signal_count,
+        a,
+        p_raw,
+        p_extremized,
+        p_final,
+        result,
     )
 
     return result
