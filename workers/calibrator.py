@@ -1,137 +1,139 @@
-import logging
 import math
+import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+ACCURACY_TO_ALPHA = {
+    "high": 0.6,
+    "medium": 0.75,
+    "low": 0.9,
+}
 
-def extremize(p: float, alpha: float) -> float:
-    """
-    Power-law extremizer: p_extreme = p^alpha / (p^alpha + (1-p)^alpha)
-    alpha > 1 pushes probabilities away from 0.5.
-    alpha = 1.0 is identity transform.
-    """
-    if alpha == 1.0:
-        return p
-    p_clamped = max(1e-9, min(1 - 1e-9, p))
-    p_a = p_clamped ** alpha
-    q_a = (1.0 - p_clamped) ** alpha
-    return p_a / (p_a + q_a)
+CLAMP_MIN = 0.05
+CLAMP_MAX = 0.95
 
 
-def compute_signal_agreement(signals: dict) -> int:
-    """
-    Given a dict of named signal values (probabilities or directional floats),
-    count how many independent signals agree in direction relative to 0.5.
-    Returns the count of signals pointing in the majority direction.
-    """
-    if not signals:
-        return 0
-
-    above = sum(1 for v in signals.values() if v is not None and v > 0.5)
-    below = sum(1 for v in signals.values() if v is not None and v < 0.5)
-    agreeing = max(above, below)
-    return agreeing
-
-
-def get_alpha_for_agreement(agreeing_count: int) -> float:
-    """
-    Map signal agreement count to extremizing alpha.
-    3+ signals agree -> alpha=1.8 (strong push)
-    2 signals agree  -> alpha=1.3 (moderate push)
-    <2 signals agree -> alpha=1.0 (no change)
-    """
-    if agreeing_count >= 3:
-        return 1.8
-    elif agreeing_count == 2:
-        return 1.3
+def get_alpha_from_accuracy(backtest_accuracy: float) -> float:
+    if backtest_accuracy >= 0.80:
+        return ACCURACY_TO_ALPHA["high"]
+    elif backtest_accuracy >= 0.70:
+        return ACCURACY_TO_ALPHA["medium"]
     else:
-        return 1.0
+        return ACCURACY_TO_ALPHA["low"]
 
 
-FLOOR = 0.08
-CEILING = 0.92
+def stretch_probability(p: float, alpha: float) -> float:
+    centered = p - 0.5
+    if centered == 0.0:
+        return 0.5
+    sign = 1.0 if centered > 0 else -1.0
+    abs_double = abs(2.0 * centered)
+    stretched = 0.5 + sign * (abs_double ** alpha) / 2.0
+    return stretched
 
 
-def recalibrate(
-    p_raw: float,
-    base_rate: Optional[float] = None,
-    trend: Optional[float] = None,
-    sentiment: Optional[float] = None,
-    market_momentum: Optional[float] = None,
+def clamp_probability(p: float) -> float:
+    return max(CLAMP_MIN, min(CLAMP_MAX, p))
+
+
+def calibrate(
+    raw_probability: float,
+    corroborating_signals: int = 0,
+    backtest_accuracy: float = 0.804,
+    market_price: Optional[float] = None,
     question_id: Optional[str] = None,
 ) -> float:
-    """
-    Full recalibration pipeline with extremizing step.
+    p = float(raw_probability)
+    p = clamp_probability(p)
 
-    Steps:
-    1. Collect available signals.
-    2. Compute signal agreement count.
-    3. Select alpha based on agreement tier.
-    4. Apply power-law extremizer.
-    5. Clamp to [FLOOR, CEILING].
-    6. Log pre/post probabilities and confidence tier for RL tracking.
+    # Existing calibration step: shrink toward market price if available
+    if market_price is not None:
+        blend_weight = 0.7
+        p = blend_weight * p + (1.0 - blend_weight) * market_price
 
-    Returns the recalibrated probability.
-    """
-    signals = {
-        "base_rate": base_rate,
-        "trend": trend,
-        "sentiment": sentiment,
-        "market_momentum": market_momentum,
-    }
+    pre_stretch = p
 
-    available_signals = {k: v for k, v in signals.items() if v is not None}
+    # Gate: only stretch when evidence is sufficient
+    if corroborating_signals >= 3:
+        alpha = get_alpha_from_accuracy(backtest_accuracy)
+        p_stretched = stretch_probability(p, alpha)
+        p_stretched = clamp_probability(p_stretched)
 
-    agreeing_count = compute_signal_agreement(available_signals)
-    alpha = get_alpha_for_agreement(agreeing_count)
+        logger.info(
+            "confidence_stretch",
+            extra={
+                "question_id": question_id,
+                "pre_stretch": pre_stretch,
+                "post_stretch": p_stretched,
+                "alpha": alpha,
+                "backtest_accuracy": backtest_accuracy,
+                "corroborating_signals": corroborating_signals,
+                "stretch_delta": p_stretched - pre_stretch,
+            },
+        )
 
-    if agreeing_count >= 3:
-        confidence_tier = "HIGH"
-    elif agreeing_count == 2:
-        confidence_tier = "MEDIUM"
+        return p_stretched
     else:
-        confidence_tier = "LOW"
+        logger.info(
+            "confidence_stretch_skipped",
+            extra={
+                "question_id": question_id,
+                "pre_stretch": pre_stretch,
+                "post_stretch": pre_stretch,
+                "corroborating_signals": corroborating_signals,
+                "reason": "insufficient_evidence",
+            },
+        )
 
-    p_extremized = extremize(p_raw, alpha)
-
-    p_final = max(FLOOR, min(CEILING, p_extremized))
-
-    logger.info(
-        "recalibrate | question_id=%s | p_raw=%.4f | p_extremized=%.4f | "
-        "p_final=%.4f | alpha=%.2f | agreeing_signals=%d | confidence_tier=%s | "
-        "signals=%s",
-        question_id or "unknown",
-        p_raw,
-        p_extremized,
-        p_final,
-        alpha,
-        agreeing_count,
-        confidence_tier,
-        {k: round(v, 4) for k, v in available_signals.items()},
-    )
-
-    return p_final
+        return pre_stretch
 
 
-def calibrate_probability(
-    p_raw: float,
-    signals: Optional[dict] = None,
-    question_id: Optional[str] = None,
-) -> float:
-    """
-    Convenience wrapper that accepts a signals dict with keys:
-    base_rate, trend, sentiment, market_momentum.
-    Falls back gracefully if signals is None or missing keys.
-    """
-    if signals is None:
-        signals = {}
+def calibrate_batch(
+    predictions: list,
+    backtest_accuracy: float = 0.804,
+) -> list:
+    results = []
+    for pred in predictions:
+        if isinstance(pred, dict):
+            raw_p = pred.get("probability", 0.5)
+            signals = pred.get("corroborating_signals", 0)
+            market_p = pred.get("market_price", None)
+            qid = pred.get("question_id", None)
+        else:
+            raw_p = float(pred)
+            signals = 0
+            market_p = None
+            qid = None
 
-    return recalibrate(
-        p_raw=p_raw,
-        base_rate=signals.get("base_rate"),
-        trend=signals.get("trend"),
-        sentiment=signals.get("sentiment"),
-        market_momentum=signals.get("market_momentum"),
-        question_id=question_id,
-    )
+        calibrated = calibrate(
+            raw_probability=raw_p,
+            corroborating_signals=signals,
+            backtest_accuracy=backtest_accuracy,
+            market_price=market_p,
+            question_id=qid,
+        )
+        results.append(calibrated)
+
+    return results
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    test_cases = [
+        {"probability": 0.62, "corroborating_signals": 5, "question_id": "test_1"},
+        {"probability": 0.58, "corroborating_signals": 2, "question_id": "test_2"},
+        {"probability": 0.75, "corroborating_signals": 4, "market_price": 0.65, "question_id": "test_3"},
+        {"probability": 0.45, "corroborating_signals": 3, "question_id": "test_4"},
+    ]
+
+    for tc in test_cases:
+        result = calibrate(
+            raw_probability=tc["probability"],
+            corroborating_signals=tc.get("corroborating_signals", 0),
+            backtest_accuracy=0.804,
+            market_price=tc.get("market_price"),
+            question_id=tc.get("question_id"),
+        )
+        print(f"Input: {tc['probability']:.3f} signals={tc.get('corroborating_signals',0)} -> Output: {result:.4f}")
