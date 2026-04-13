@@ -1,148 +1,176 @@
 import math
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Tunable via RL iterations
+EXTREMIZE_FACTOR = 1.6
 
-def sharpen_probability(p: float, k: float = 1.5) -> float:
-    """
-    Sharpen a probability by scaling its logit by factor k.
-    
-    Converts p to logit space (log(p/(1-p))), multiplies by k,
-    then converts back via sigmoid. Preserves ordering and symmetry around 0.5.
-    
-    Args:
-        p: Probability in [0, 1]
-        k: Sharpening factor (>1 pushes away from 0.5, <1 pulls toward 0.5)
-    
-    Returns:
-        Sharpened probability clipped to [0.05, 0.95]
-    """
-    # Clip input to avoid log(0)
-    p_clipped = max(1e-9, min(1 - 1e-9, p))
-    
-    # Convert to logit space
-    logit = math.log(p_clipped / (1 - p_clipped))
-    
-    # Scale by sharpening factor
-    logit_sharpened = logit * k
-    
-    # Convert back via sigmoid
-    p_sharpened = 1.0 / (1.0 + math.exp(-logit_sharpened))
-    
-    # Apply configurable bounds to prevent extreme values
-    p_sharpened = max(0.05, min(0.95, p_sharpened))
-    
-    return p_sharpened
+# Base rates by category (historical resolution rates for YES)
+BASE_RATES = {
+    "binary_by_date": 0.35,
+    "election": 0.50,
+    "sports": 0.50,
+    "economic_indicator": 0.45,
+    "default": 0.40,
+}
+
+# Blend weights for base-rate anchoring
+BASE_RATE_WEIGHT = 0.30
+MODEL_WEIGHT = 0.70
+
+# Safety clamp bounds
+CLAMP_LOW = 0.05
+CLAMP_HIGH = 0.95
 
 
-def get_confidence_weight(num_confirming_signals: int) -> float:
+def detect_category(contract: Optional[dict]) -> str:
     """
-    Get the sharpening factor k based on number of confirming signals.
-    
-    Only push probabilities further from 0.5 when multiple independent
-    signals agree — that's when the model should be more confident.
-    
-    Args:
-        num_confirming_signals: Count of independent signals that agree
-    
-    Returns:
-        Sharpening factor k
+    Detect contract category from metadata for base-rate anchoring.
+    Returns a key into BASE_RATES.
     """
-    if num_confirming_signals >= 3:
-        return 1.8
-    elif num_confirming_signals == 2:
-        return 1.5
+    if not contract:
+        return "default"
+
+    title = (contract.get("title") or "").lower()
+    question = (contract.get("question") or "").lower()
+    category = (contract.get("category") or "").lower()
+    text = title + " " + question + " " + category
+
+    if any(kw in text for kw in ["election", "president", "senator", "governor", "vote", "poll"]):
+        return "election"
+    if any(kw in text for kw in ["win", "championship", "match", "game", "score", "nfl", "nba", "mlb", "nhl", "soccer"]):
+        return "sports"
+    if any(kw in text for kw in ["gdp", "inflation", "unemployment", "rate", "fed", "cpi", "interest"]):
+        return "economic_indicator"
+    if any(kw in text for kw in ["will", "by", "before", "happen", "occur", "complete", "launch", "release", "announce"]):
+        return "binary_by_date"
+
+    return "default"
+
+
+def anchor_to_base_rate(p: float, base_rate: float) -> float:
+    """
+    Blend model probability with historical base rate.
+    p_anchored = MODEL_WEIGHT * p + BASE_RATE_WEIGHT * base_rate
+    """
+    anchored = MODEL_WEIGHT * p + BASE_RATE_WEIGHT * base_rate
+    return anchored
+
+
+def extremize(p: float, k: float = EXTREMIZE_FACTOR) -> float:
+    """
+    Apply log-odds extremizing transform.
+
+    Steps:
+      1. Convert p to log-odds: lo = log(p / (1-p))
+      2. Scale by factor k:     lo_ext = k * lo
+      3. Convert back:          p_ext = 1 / (1 + exp(-lo_ext))
+      4. Clamp to [CLAMP_LOW, CLAMP_HIGH]
+
+    With k=1.6:
+      p=0.58 -> ~0.64
+      p=0.42 -> ~0.36
+    """
+    # Guard against degenerate inputs
+    p = float(p)
+    p = max(1e-9, min(1.0 - 1e-9, p))
+
+    lo = math.log(p / (1.0 - p))
+    lo_ext = k * lo
+
+    # Guard against overflow in exp
+    if lo_ext > 700:
+        p_ext = 1.0
+    elif lo_ext < -700:
+        p_ext = 0.0
     else:
-        return 1.3
+        p_ext = 1.0 / (1.0 + math.exp(-lo_ext))
+
+    if not math.isfinite(p_ext):
+        logger.warning("extremize produced non-finite value for p=%.6f k=%.3f, returning original", p, k)
+        return max(CLAMP_LOW, min(CLAMP_HIGH, p))
+
+    p_clamped = max(CLAMP_LOW, min(CLAMP_HIGH, p_ext))
+    return p_clamped
 
 
-def calibrate(p: float, num_confirming_signals: int = 1) -> float:
+def calibrate(
+    raw_prob: float,
+    contract: Optional[dict] = None,
+    existing_calibrated: Optional[float] = None,
+    extremize_factor: float = EXTREMIZE_FACTOR,
+) -> dict:
     """
-    Apply calibration adjustments to a raw model probability.
-    
-    The mathematical basis: if true accuracy is 80% but average |p-0.5| is
-    only 6%, then E[|p-0.5|] should be closer to 20-25% for a well-calibrated
-    model with that accuracy. Sharpening by 1.5x in logit space roughly doubles
-    the deviation from 0.5, bringing separation to ~12%.
-    
-    Args:
-        p: Raw probability from model
-        num_confirming_signals: Number of independent signals confirming direction
-    
-    Returns:
-        Calibrated and sharpened probability
-    """
-    # --- Existing calibration adjustments go here ---
-    # (placeholder: apply any existing linear/isotonic/Platt scaling here)
-    p_calibrated = p  # Replace with existing calibration logic if any
+    Full calibration pipeline:
 
-    # --- Apply sharpening AFTER existing calibration adjustments ---
-    k = get_confidence_weight(num_confirming_signals)
-    
-    # Log pre-sharpen probability for monitoring
+    1. Start from existing_calibrated if available, else raw_prob.
+    2. Detect contract category and look up historical base rate.
+    3. Anchor to base rate (70% model, 30% base rate).
+    4. Apply log-odds extremizing with factor k.
+    5. Clamp to [CLAMP_LOW, CLAMP_HIGH].
+
+    Returns a dict with full audit trail for monitoring.
+    """
+    # Step 0: Choose starting probability
+    start_prob = existing_calibrated if existing_calibrated is not None else raw_prob
+    start_prob = float(start_prob)
+
+    if not math.isfinite(start_prob):
+        logger.error("calibrate received non-finite start_prob=%.6f, falling back to 0.5", start_prob)
+        start_prob = 0.5
+
+    start_prob = max(1e-9, min(1.0 - 1e-9, start_prob))
+
+    # Step 1: Detect category
+    category = detect_category(contract)
+    base_rate = BASE_RATES.get(category, BASE_RATES["default"])
+
+    # Step 2: Base-rate anchoring (before extremizing)
+    anchored_prob = anchor_to_base_rate(start_prob, base_rate)
+
+    # Step 3: Extremizing
+    extremized_prob = extremize(anchored_prob, k=extremize_factor)
+
+    # Step 4: Logging
     logger.info(
-        "calibrator pre_sharpen: p=%.6f, num_signals=%d, k=%.2f",
-        p_calibrated,
-        num_confirming_signals,
-        k,
+        "calibrate | raw=%.4f | existing_cal=%.4f | category=%s | base_rate=%.3f | "
+        "anchored=%.4f | extremized=%.4f | k=%.3f",
+        raw_prob,
+        existing_calibrated if existing_calibrated is not None else float("nan"),
+        category,
+        base_rate,
+        anchored_prob,
+        extremized_prob,
+        extremize_factor,
     )
-    
-    p_sharpened = sharpen_probability(p_calibrated, k=k)
-    
-    # Log post-sharpen probability for monitoring
-    logger.info(
-        "calibrator post_sharpen: p_before=%.6f, p_after=%.6f, delta=%.6f, |p-0.5|_before=%.6f, |p-0.5|_after=%.6f",
-        p_calibrated,
-        p_sharpened,
-        p_sharpened - p_calibrated,
-        abs(p_calibrated - 0.5),
-        abs(p_sharpened - 0.5),
-    )
-    
-    return p_sharpened
+
+    return {
+        "raw_prob": raw_prob,
+        "existing_calibrated": existing_calibrated,
+        "category": category,
+        "base_rate": base_rate,
+        "anchored_prob": anchored_prob,
+        "extremized_prob": extremized_prob,
+        "final_prob": extremized_prob,
+        "extremize_factor": extremize_factor,
+    }
 
 
-def extremize(p: float, a: float = 2.5) -> float:
+def calibrate_simple(
+    raw_prob: float,
+    contract: Optional[dict] = None,
+    existing_calibrated: Optional[float] = None,
+    extremize_factor: float = EXTREMIZE_FACTOR,
+) -> float:
     """
-    Extremize a probability using power-law transform.
-    
-    This is an alternative extremizing approach using the formula:
-        p_ext = p^a / (p^a + (1-p)^a)
-    
-    At a=2.5: p=0.65 -> ~0.75 (delta=0.10), hitting the separation target.
-    
-    Args:
-        p: Probability in [0, 1]
-        a: Extremizing exponent (>1 pushes away from 0.5)
-    
-    Returns:
-        Extremized probability clipped to [0.05, 0.95]
+    Convenience wrapper returning only the final calibrated probability.
     """
-    # Guard: skip if already extreme or invalid
-    if not (0.01 < p < 0.99):
-        logger.warning("extremize: p=%.6f out of safe range, returning clipped value", p)
-        return max(0.05, min(0.95, p))
-    
-    p_a = p ** a
-    one_minus_p_a = (1.0 - p) ** a
-    
-    denom = p_a + one_minus_p_a
-    if denom == 0:
-        logger.warning("extremize: zero denominator for p=%.6f, a=%.2f", p, a)
-        return p
-    
-    p_ext = p_a / denom
-    
-    # Hard floor/ceiling after extremizing to prevent calibrator rejection
-    p_ext = max(0.05, min(0.95, p_ext))
-    
-    logger.info(
-        "extremize: p_in=%.6f, a=%.2f, p_out=%.6f, delta=%.6f",
-        p,
-        a,
-        p_ext,
-        p_ext - p,
+    result = calibrate(
+        raw_prob=raw_prob,
+        contract=contract,
+        existing_calibrated=existing_calibrated,
+        extremize_factor=extremize_factor,
     )
-    
-    return p_ext
+    return result["final_prob"]
