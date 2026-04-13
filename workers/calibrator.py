@@ -1,78 +1,132 @@
 import logging
 import math
-import os
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+CATEGORY_BASE_RATES = {
+    "geopolitical": 0.35,
+    "economic": 0.50,
+    "tech": 0.55,
+    "default": 0.50,
+}
 
-def temperature_sharpen(p: float, T: float = 0.6) -> float:
-    p = max(1e-9, min(1 - 1e-9, p))
-    p_T = p ** T
-    q_T = (1.0 - p) ** T
-    return p_T / (p_T + q_T)
+MODEL_WEIGHT = 0.75
+BASE_RATE_WEIGHT = 0.25
+EXTREMIZE_ALPHA = 1.5
+EXTREMIZE_THRESHOLD = 0.08
+CLIP_LOW = 0.03
+CLIP_HIGH = 0.97
 
 
-def adjust_probability(
-    p: float,
-    sentiment_signal: float | None = None,
-    trend_signal: float | None = None,
-    base_rate_signal: float | None = None,
-    T: float = 0.6,
-    agreement_boost: float = 0.05,
-    floor: float = 0.05,
-    ceiling: float = 0.95,
-) -> float:
-    p = max(1e-9, min(1 - 1e-9, float(p)))
-    pre_sharp = p
+def extremize(p: float, alpha: float = EXTREMIZE_ALPHA) -> float:
+    p = max(min(p, 0.999), 0.001)
+    p_extreme = 0.5 + alpha * (p - 0.5)
+    p_extreme = max(CLIP_LOW, min(CLIP_HIGH, p_extreme))
+    return p_extreme
 
-    direction = 1 if p >= 0.5 else -1
 
-    signals = []
-    if sentiment_signal is not None:
-        signals.append(sentiment_signal)
-    if trend_signal is not None:
-        signals.append(trend_signal)
-    if base_rate_signal is not None:
-        signals.append(base_rate_signal)
+def apply_base_rate_anchoring(p: float, category: Optional[str] = None) -> float:
+    base_rate = CATEGORY_BASE_RATES.get(category or "default", CATEGORY_BASE_RATES["default"])
+    anchored = MODEL_WEIGHT * p + BASE_RATE_WEIGHT * base_rate
+    return anchored
 
-    agreeing = sum(1 for s in signals if (s >= 0.5) == (p >= 0.5))
 
-    p_sharp = temperature_sharpen(p, T=T)
+def confidence_gated_extremize(p: float, alpha: float = EXTREMIZE_ALPHA) -> float:
+    if abs(p - 0.5) > EXTREMIZE_THRESHOLD:
+        return extremize(p, alpha=alpha)
+    return p
 
-    if agreeing >= 3:
-        p_sharp = p_sharp + direction * agreement_boost
-        logger.info(
-            "signal_agreement_boost applied: %d signals agree, boost=%.4f",
-            agreeing,
-            agreement_boost,
+
+def calibrate(p_raw: float, category: Optional[str] = None) -> float:
+    logger.info(
+        "calibration_start",
+        extra={
+            "event": "calibration_start",
+            "p_raw": p_raw,
+            "category": category,
+        },
+    )
+
+    try:
+        p = float(p_raw)
+        if not math.isfinite(p):
+            logger.warning("Non-finite probability received, defaulting to 0.5", extra={"p_raw": p_raw})
+            p = 0.5
+        p = max(0.0, min(1.0, p))
+
+        p_anchored = apply_base_rate_anchoring(p, category=category)
+
+        logger.debug(
+            "calibration_after_anchoring",
+            extra={
+                "event": "calibration_after_anchoring",
+                "p_raw": p_raw,
+                "p_anchored": p_anchored,
+                "category": category,
+            },
         )
 
-    p_sharp = max(floor, min(ceiling, p_sharp))
+        p_final = confidence_gated_extremize(p_anchored, alpha=EXTREMIZE_ALPHA)
 
-    logger.info(
-        "calibrator: pre_sharpening=%.6f post_sharpening=%.6f "
-        "(T=%.2f, agreeing_signals=%d/%d, floor=%.2f, ceiling=%.2f)",
-        pre_sharp,
-        p_sharp,
-        T,
-        agreeing,
-        len(signals),
-        floor,
-        ceiling,
-    )
+        logger.info(
+            "calibration_complete",
+            extra={
+                "event": "calibration_complete",
+                "p_raw": p_raw,
+                "p_anchored": p_anchored,
+                "p_final": p_final,
+                "category": category,
+                "extremized": abs(p_anchored - 0.5) > EXTREMIZE_THRESHOLD,
+                "separation_contribution": abs(p_final - 0.5),
+            },
+        )
 
-    return p_sharp
+        return p_final
+
+    except Exception as exc:
+        logger.error(
+            "calibration_error",
+            extra={
+                "event": "calibration_error",
+                "p_raw": p_raw,
+                "error": str(exc),
+            },
+        )
+        return float(p_raw) if math.isfinite(float(p_raw)) else 0.5
 
 
-def calibrate(
-    p: float,
-    sentiment_signal: float | None = None,
-    trend_signal: float | None = None,
-    base_rate_signal: float | None = None,
-) -> float:
-    return adjust_probability(
-        p=p,
-        sentiment_signal=sentiment_signal,
-        trend_signal=trend_signal,
-        base_rate_signal=base_rate_signal,
-    )
+def batch_calibrate(probabilities: list, categories: Optional[list] = None) -> list:
+    if categories is None:
+        categories = [None] * len(probabilities)
+    if len(categories) != len(probabilities):
+        logger.warning(
+            "batch_calibrate_length_mismatch",
+            extra={
+                "event": "batch_calibrate_length_mismatch",
+                "n_probs": len(probabilities),
+                "n_categories": len(categories),
+            },
+        )
+        categories = (categories + [None] * len(probabilities))[: len(probabilities)]
+
+    results = []
+    for p, cat in zip(probabilities, categories):
+        results.append(calibrate(p, category=cat))
+
+    if results:
+        separations = [abs(p - 0.5) for p in results]
+        avg_separation = sum(separations) / len(separations)
+        logger.info(
+            "batch_calibration_summary",
+            extra={
+                "event": "batch_calibration_summary",
+                "n": len(results),
+                "avg_separation": avg_separation,
+                "min_separation": min(separations),
+                "max_separation": max(separations),
+                "above_gate_count": sum(1 for s in separations if s > 0.10),
+            },
+        )
+
+    return results
