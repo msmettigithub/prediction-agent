@@ -1,232 +1,82 @@
-import numpy as np
+import logging
+import math
 from typing import Optional
 
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+CATEGORY_BASE_RATES = {
+    "sports": 0.52,
+    "politics": 0.48,
+    "economics": 0.50,
+    "technology": 0.51,
+    "entertainment": 0.50,
+    "science": 0.49,
+    "default": 0.50,
+}
 
-# Blend weight: calibrated = ALPHA * raw + (1 - ALPHA) * 0.5
-# Reduced from ~0.5 to 0.75 (cut prior pull by >40%)
-ALPHA: float = 0.75
-
-# Confidence multiplier when multiple signals agree on direction
-SIGNAL_AGREEMENT_MULTIPLIER: float = 1.3
-SIGNAL_AGREEMENT_THRESHOLD: int = 3  # need at least this many agreeing signals
-
-# Trade deployment thresholds (inclusive)
-DEPLOY_THRESHOLD_HIGH: float = 0.57
-DEPLOY_THRESHOLD_LOW: float = 0.43
-
-# Final probability clamp
-PROB_MIN: float = 0.05
-PROB_MAX: float = 0.95
-
-
-# ---------------------------------------------------------------------------
-# Core calibration helpers
-# ---------------------------------------------------------------------------
-
-def blend_toward_prior(raw: float, alpha: float = ALPHA) -> float:
-    """
-    Pull raw probability toward 0.5 using a weighted blend.
-
-    calibrated = alpha * raw + (1 - alpha) * 0.5
-
-    Higher alpha => less shrinkage toward 0.5.
-    """
-    raw = float(np.clip(raw, 0.0, 1.0))
-    return alpha * raw + (1.0 - alpha) * 0.5
+BASE_RATE_WEIGHT = 0.3
+MODEL_WEIGHT = 0.7
+DEFAULT_K = 1.8
+FENCE_SITTING_K = 2.2
+FENCE_SITTING_LOW = 0.47
+FENCE_SITTING_HIGH = 0.53
+CLAMP_LOW = 0.03
+CLAMP_HIGH = 0.97
 
 
-def count_agreeing_signals(
-    sentiment: Optional[float],
-    trend: Optional[float],
-    base_rate: Optional[float],
-    momentum: Optional[float],
-    neutral_band: float = 0.05,
-) -> int:
-    """
-    Count how many independent signals agree on the same directional side
-    (above-neutral = bullish, below-neutral = bearish).
-
-    Each signal is expected to be a probability-like float in [0, 1].
-    Values within `neutral_band` of 0.5 are considered neutral and excluded.
-
-    Returns the *net* agreement count: positive means bullish majority,
-    negative means bearish majority.  We return the *absolute* count of the
-    majority side so callers can compare against SIGNAL_AGREEMENT_THRESHOLD.
-    """
-    signals = [sentiment, trend, base_rate, momentum]
-    bullish = sum(1 for s in signals if s is not None and s > 0.5 + neutral_band)
-    bearish = sum(1 for s in signals if s is not None and s < 0.5 - neutral_band)
-    return max(bullish, bearish)
+def extremize(p: float, k: float = DEFAULT_K) -> float:
+    p = clamp(p, 0.001, 0.999)
+    odds = p / (1.0 - p)
+    odds_k = odds ** k
+    p_ext = odds_k / (1.0 + odds_k)
+    return clamp(p_ext, CLAMP_LOW, CLAMP_HIGH)
 
 
-def apply_signal_agreement_amplifier(
-    prob: float,
-    n_agreeing: int,
-    multiplier: float = SIGNAL_AGREEMENT_MULTIPLIER,
-    threshold: int = SIGNAL_AGREEMENT_THRESHOLD,
-) -> float:
-    """
-    When `n_agreeing` signals (or more) point in the same direction, push the
-    probability further from 0.5 by scaling its distance from 0.5.
-
-        distance = prob - 0.5
-        new_prob = 0.5 + distance * multiplier
-    """
-    if n_agreeing < threshold:
-        return prob
-    distance = prob - 0.5
-    amplified = 0.5 + distance * multiplier
-    return float(np.clip(amplified, PROB_MIN, PROB_MAX))
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
 
 
-def extremize(p: float, alpha: float = 1.6) -> float:
-    """
-    Satopää et al. extremizing transform.
-
-    Pushes *p* away from 0.5 proportionally to existing conviction.
-    alpha = 1.0  → identity
-    alpha > 1.0  → extremize (push further from 0.5)
-    alpha < 1.0  → shrink toward 0.5
-
-    Example outputs (alpha=1.6):
-        p=0.70  → 0.762  (+6.2 pp)
-        p=0.65  → 0.710  (+6.0 pp)
-        p=0.55  → 0.572  (+2.2 pp)
-        p=0.50  → 0.500  (unchanged)
-    """
-    p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
-    pa = p ** alpha
-    return float(pa / (pa + (1.0 - p) ** alpha))
+def anchor_to_base_rate(p_model: float, category: Optional[str] = None) -> float:
+    base_rate = CATEGORY_BASE_RATES.get(category or "default", CATEGORY_BASE_RATES["default"])
+    return MODEL_WEIGHT * p_model + BASE_RATE_WEIGHT * base_rate
 
 
-# ---------------------------------------------------------------------------
-# Main calibration entry point
-# ---------------------------------------------------------------------------
+def calibrate(p_raw: float, category: Optional[str] = None) -> float:
+    logger.info("CALIBRATOR_VERSION=v3_extremize_k1.8_base_rate_anchor")
 
-def calibrate(
-    raw_prob: float,
-    sentiment: Optional[float] = None,
-    trend: Optional[float] = None,
-    base_rate: Optional[float] = None,
-    momentum: Optional[float] = None,
-    use_extremize: bool = False,
-    extremize_alpha: float = 1.6,
-) -> float:
-    """
-    Full calibration pipeline.
+    p_raw = clamp(p_raw, CLAMP_LOW, CLAMP_HIGH)
 
-    Steps
-    -----
-    1. Blend raw probability toward 0.5 with reduced shrinkage (ALPHA=0.75).
-    2. Count how many independent signals agree on direction.
-    3. If enough signals agree, amplify the distance from 0.5 by
-       SIGNAL_AGREEMENT_MULTIPLIER.
-    4. Optionally apply the Satopää extremizing transform.
-    5. Clamp result to [PROB_MIN, PROB_MAX].
+    logger.info("calibration_input", extra={"p_raw": p_raw, "category": category})
 
-    Parameters
-    ----------
-    raw_prob : float
-        Model's raw predicted probability in [0, 1].
-    sentiment, trend, base_rate, momentum : float or None
-        Independent signal probabilities in [0, 1].  Pass None to omit.
-    use_extremize : bool
-        Apply Satopää extremizing transform as an additional step.
-    extremize_alpha : float
-        Alpha parameter for the extremizing transform (default 1.6).
+    p_anchored = anchor_to_base_rate(p_raw, category)
+    logger.info("calibration_anchored", extra={"p_anchored": p_anchored, "category": category})
 
-    Returns
-    -------
-    float
-        Calibrated probability in [PROB_MIN, PROB_MAX].
-    """
-    # Step 1: reduce prior pull
-    prob = blend_toward_prior(raw_prob, alpha=ALPHA)
+    is_fence_sitting = FENCE_SITTING_LOW <= p_raw <= FENCE_SITTING_HIGH
+    k = FENCE_SITTING_K if is_fence_sitting else DEFAULT_K
 
-    # Step 2 & 3: signal-agreement amplifier
-    n_agreeing = count_agreeing_signals(sentiment, trend, base_rate, momentum)
-    prob = apply_signal_agreement_amplifier(prob, n_agreeing)
+    p_final = extremize(p_anchored, k=k)
+    p_final = clamp(p_final, CLAMP_LOW, CLAMP_HIGH)
 
-    # Step 4 (optional): Satopää extremizing
-    if use_extremize:
-        prob = extremize(prob, alpha=extremize_alpha)
-
-    # Step 5: safety clamp
-    prob = float(np.clip(prob, PROB_MIN, PROB_MAX))
-
-    return prob
-
-
-# ---------------------------------------------------------------------------
-# Deployment gate
-# ---------------------------------------------------------------------------
-
-def should_deploy(prob: float) -> bool:
-    """
-    Return True when the calibrated probability is confident enough to trade.
-
-    Thresholds lowered from 0.60/0.40 to 0.57/0.43 so that more trades
-    pass the gate while still filtering weak signals.
-    """
-    return prob >= DEPLOY_THRESHOLD_HIGH or prob <= DEPLOY_THRESHOLD_LOW
-
-
-def deployment_side(prob: float) -> Optional[str]:
-    """
-    Return 'YES', 'NO', or None (do not trade).
-
-    Mirrors should_deploy() but also communicates direction.
-    """
-    if prob >= DEPLOY_THRESHOLD_HIGH:
-        return "YES"
-    if prob <= DEPLOY_THRESHOLD_LOW:
-        return "NO"
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Convenience wrapper used by the trading pipeline
-# ---------------------------------------------------------------------------
-
-def calibrate_and_gate(
-    raw_prob: float,
-    sentiment: Optional[float] = None,
-    trend: Optional[float] = None,
-    base_rate: Optional[float] = None,
-    momentum: Optional[float] = None,
-    use_extremize: bool = False,
-    extremize_alpha: float = 1.6,
-) -> dict:
-    """
-    Run full calibration and deployment gate in one call.
-
-    Returns
-    -------
-    dict with keys:
-        - "raw_prob"        : original input
-        - "calibrated_prob" : fully calibrated probability
-        - "deploy"          : bool – whether to trade
-        - "side"            : "YES", "NO", or None
-        - "n_agreeing"      : number of signals that agreed on direction
-    """
-    n_agreeing = count_agreeing_signals(sentiment, trend, base_rate, momentum)
-    calibrated = calibrate(
-        raw_prob,
-        sentiment=sentiment,
-        trend=trend,
-        base_rate=base_rate,
-        momentum=momentum,
-        use_extremize=use_extremize,
-        extremize_alpha=extremize_alpha,
+    logger.info(
+        "calibration_output",
+        extra={
+            "p_raw": p_raw,
+            "p_anchored": p_anchored,
+            "p_final": p_final,
+            "k_used": k,
+            "is_fence_sitting": is_fence_sitting,
+            "category": category,
+            "delta": p_final - p_raw,
+        },
     )
-    return {
-        "raw_prob": raw_prob,
-        "calibrated_prob": calibrated,
-        "deploy": should_deploy(calibrated),
-        "side": deployment_side(calibrated),
-        "n_agreeing": n_agreeing,
-    }
+
+    return p_final
+
+
+def calibrate_batch(probabilities: list, categories: Optional[list] = None) -> list:
+    if categories is None:
+        categories = [None] * len(probabilities)
+    results = []
+    for p, cat in zip(probabilities, categories):
+        results.append(calibrate(p, category=cat))
+    return results
