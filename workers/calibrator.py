@@ -1,137 +1,117 @@
-import math
+import numpy as np
 import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+EXTREMIZING_K = 1.5
+
 CATEGORY_BASE_RATES = {
-    "geopolitical": 0.30,
-    "tech_earnings": 0.65,
-    "macro_economic": 0.45,
-    "sports": 0.50,
-    "political_election": 0.50,
+    "geopolitical": 0.35,
+    "economic_indicator": 0.55,
+    "tech": 0.45,
+    "sports": 0.40,
     "default": 0.50,
 }
 
-ALPHA = 0.6
-BASE_RATE_WEIGHT = 0.25
-FLOOR = 0.08
-CEILING = 0.92
-MIN_CONFIDENCE_DELTA = 0.03
+BASE_RATE_WEIGHT = 0.15
+BASE_RATE_RAW_WEIGHT = 1.0 - BASE_RATE_WEIGHT
+
+LOW_CONVICTION_THRESHOLD = 0.03
 
 
-def sharpen(p: float, alpha: float = ALPHA) -> float:
-    """
-    Confidence-stretching sharpening function.
-    p_sharp = 0.5 + sign(p-0.5) * |2*(p-0.5)|^alpha / 2
-    alpha < 1 stretches probabilities away from 0.5.
-    """
-    p = max(0.0, min(1.0, p))
-    delta = p - 0.5
-    if delta == 0.0:
-        return 0.5
-    sign = 1.0 if delta > 0 else -1.0
-    stretched = sign * (abs(2.0 * delta) ** alpha) / 2.0
-    return 0.5 + stretched
+def get_base_rate(category: Optional[str]) -> float:
+    if category is None:
+        return CATEGORY_BASE_RATES["default"]
+    return CATEGORY_BASE_RATES.get(category.lower(), CATEGORY_BASE_RATES["default"])
 
 
-def anchor_to_base_rate(p: float, category: Optional[str], weight: float = BASE_RATE_WEIGHT) -> float:
-    """
-    Blend model probability with category-specific base rate.
-    p_anchored = (1 - weight) * p + weight * base_rate
-    """
-    key = (category or "default").lower()
-    base_rate = CATEGORY_BASE_RATES.get(key, CATEGORY_BASE_RATES["default"])
-    return (1.0 - weight) * p + weight * base_rate
+def apply_base_rate_anchoring(p_raw: float, category: Optional[str]) -> float:
+    base_rate = get_base_rate(category)
+    p_blended = BASE_RATE_RAW_WEIGHT * p_raw + BASE_RATE_WEIGHT * base_rate
+    logger.debug(
+        "base_rate_anchoring: p_raw=%.4f category=%s base_rate=%.4f p_blended=%.4f",
+        p_raw,
+        category,
+        base_rate,
+        p_blended,
+    )
+    return p_blended
 
 
-def calibrate(p: float, category: Optional[str] = None) -> Optional[float]:
-    """
-    Full calibration pipeline:
-    1. Sharpen probability away from 0.5 (power-law stretch)
-    2. Anchor to category base rate
-    3. Clip to floor/ceiling
-    4. Return None (skip trade) if |p - 0.5| < MIN_CONFIDENCE_DELTA
+def apply_extremizing(p_calibrated: float, k: float = EXTREMIZING_K) -> float:
+    raw_shift = k * (p_calibrated - 0.5)
+    clamped_shift = max(-0.45, min(0.45, raw_shift))
+    p_extremized = 0.5 + clamped_shift
+    logger.debug(
+        "extremizing: p_calibrated=%.4f k=%.2f raw_shift=%.4f clamped_shift=%.4f p_extremized=%.4f",
+        p_calibrated,
+        k,
+        raw_shift,
+        clamped_shift,
+        p_extremized,
+    )
+    return p_extremized
 
-    Returns calibrated probability, or None if trade should be skipped.
-    """
-    pre_calibration = p
 
-    sharpened = sharpen(p, alpha=ALPHA)
+def calibrate(
+    p_raw: float,
+    category: Optional[str] = None,
+    k: float = EXTREMIZING_K,
+) -> Optional[float]:
+    p_raw = float(p_raw)
+    p_raw = float(np.clip(p_raw, 1e-6, 1.0 - 1e-6))
 
-    anchored = anchor_to_base_rate(sharpened, category, weight=BASE_RATE_WEIGHT)
+    logger.info("calibrate: p_raw=%.4f category=%s", p_raw, category)
 
-    clipped = max(FLOOR, min(CEILING, anchored))
-
-    confidence_delta = abs(clipped - 0.5)
-    if confidence_delta < MIN_CONFIDENCE_DELTA:
+    if abs(p_raw - 0.5) < LOW_CONVICTION_THRESHOLD:
         logger.info(
-            "calibration_skip",
-            extra={
-                "pre_calibration_p": round(pre_calibration, 6),
-                "post_sharpening_p": round(sharpened, 6),
-                "post_anchoring_p": round(anchored, 6),
-                "post_clipping_p": round(clipped, 6),
-                "confidence_delta": round(confidence_delta, 6),
-                "category": category,
-                "action": "skip_noise_trade",
-            },
+            "calibrate: low-conviction signal (|%.4f - 0.5| = %.4f < %.2f), skipping trade",
+            p_raw,
+            abs(p_raw - 0.5),
+            LOW_CONVICTION_THRESHOLD,
         )
         return None
 
+    p_blended = apply_base_rate_anchoring(p_raw, category)
+
+    p_blended = float(np.clip(p_blended, 1e-6, 1.0 - 1e-6))
+
+    p_extremized = apply_extremizing(p_blended, k=k)
+
+    p_extremized = float(np.clip(p_extremized, 0.05, 0.95))
+
     logger.info(
-        "calibration_applied",
-        extra={
-            "pre_calibration_p": round(pre_calibration, 6),
-            "post_sharpening_p": round(sharpened, 6),
-            "post_anchoring_p": round(anchored, 6),
-            "post_clipping_p": round(clipped, 6),
-            "confidence_delta": round(confidence_delta, 6),
-            "category": category,
-            "alpha": ALPHA,
-            "base_rate_weight": BASE_RATE_WEIGHT,
-        },
+        "calibrate: p_raw=%.4f -> p_blended=%.4f -> p_extremized=%.4f (category=%s, k=%.2f)",
+        p_raw,
+        p_blended,
+        p_extremized,
+        category,
+        k,
     )
 
-    return clipped
+    return p_extremized
 
 
-def calibrate_batch(predictions: list[dict]) -> list[dict]:
-    """
-    Calibrate a batch of predictions.
-    Each prediction dict must have 'probability' key.
-    Optional 'category' key for base-rate anchoring.
-
-    Returns list with calibrated predictions; skipped trades have 'skip': True.
-    """
+def calibrate_batch(
+    probs: list,
+    categories: Optional[list] = None,
+    k: float = EXTREMIZING_K,
+) -> list:
     results = []
-    for pred in predictions:
-        raw_p = pred.get("probability", 0.5)
-        category = pred.get("category", None)
-
-        calibrated_p = calibrate(raw_p, category=category)
-
-        result = dict(pred)
-        result["raw_probability"] = raw_p
-
-        if calibrated_p is None:
-            result["probability"] = None
-            result["skip"] = True
-            result["skip_reason"] = "insufficient_confidence_post_calibration"
-        else:
-            result["probability"] = calibrated_p
-            result["skip"] = False
-
-        results.append(result)
-
-    skipped = sum(1 for r in results if r.get("skip", False))
-    logger.info(
-        "calibration_batch_complete",
-        extra={
-            "total": len(predictions),
-            "skipped": skipped,
-            "passed": len(predictions) - skipped,
-        },
-    )
-
+    for i, p in enumerate(probs):
+        category = None
+        if categories is not None and i < len(categories):
+            category = categories[i]
+        try:
+            result = calibrate(p, category=category, k=k)
+            results.append(result)
+        except Exception as exc:
+            logger.warning(
+                "calibrate_batch: error on index %d p=%s: %s, falling back to None",
+                i,
+                p,
+                exc,
+            )
+            results.append(None)
     return results
