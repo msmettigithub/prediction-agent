@@ -1,74 +1,107 @@
-import math
+import numpy as np
 import logging
-from config import CALIBRATION_EXTREMIZE_FACTOR
+from typing import Union
 
 logger = logging.getLogger(__name__)
 
-EXTREMIZE_MIN_CONFIDENCE = 0.03
+CALIBRATION_TEMPERATURE = 0.6
+
+try:
+    from config import settings
+    CALIBRATION_TEMPERATURE = getattr(settings, 'CALIBRATION_TEMPERATURE', 0.6)
+except Exception:
+    pass
+
+PROB_CLAMP_MIN = 0.03
+PROB_CLAMP_MAX = 0.97
 
 
-def extremize(p: float, k: float) -> float:
-    """
-    Transform probability via log-odds scaling.
-    1. Convert p to log-odds: logit = ln(p/(1-p))
-    2. Multiply logit by extremization factor k > 1
-    3. Convert back: p_new = 1/(1+exp(-k*logit))
-    4. Clamp to [0.05, 0.95] for safety
-    Only applied when |p - 0.5| > EXTREMIZE_MIN_CONFIDENCE.
-    """
-    p_clamped = max(1e-9, min(1 - 1e-9, p))
-    confidence = abs(p_clamped - 0.5)
+def sharpen_probability(p: Union[float, np.ndarray], temperature: float = None) -> Union[float, np.ndarray]:
+    if temperature is None:
+        temperature = CALIBRATION_TEMPERATURE
 
-    if confidence <= EXTREMIZE_MIN_CONFIDENCE:
-        logger.debug(
-            f"EXTREMIZE_SKIP: p={p_clamped:.4f} confidence={confidence:.4f} "
-            f"below threshold={EXTREMIZE_MIN_CONFIDENCE}"
-        )
-        return p_clamped
+    if temperature <= 0:
+        raise ValueError(f"Temperature must be positive, got {temperature}")
 
-    logit = math.log(p_clamped / (1.0 - p_clamped))
-    scaled_logit = k * logit
-    p_new = 1.0 / (1.0 + math.exp(-scaled_logit))
-    p_new = max(0.05, min(0.95, p_new))
+    scalar_input = np.isscalar(p)
+    p = np.atleast_1d(np.array(p, dtype=float))
 
-    logger.debug(
-        f"EXTREMIZE: p={p_clamped:.4f} logit={logit:.4f} "
-        f"k={k} scaled_logit={scaled_logit:.4f} p_new={p_new:.4f}"
+    p_clamped = np.clip(p, PROB_CLAMP_MIN, PROB_CLAMP_MAX)
+
+    logit = np.log(p_clamped / (1.0 - p_clamped))
+
+    sharpened_logit = logit / temperature
+
+    sharpened = 1.0 / (1.0 + np.exp(-sharpened_logit))
+
+    sharpened = np.clip(sharpened, PROB_CLAMP_MIN, PROB_CLAMP_MAX)
+
+    if scalar_input:
+        return float(sharpened[0])
+    return sharpened
+
+
+def calibrate_probabilities(probs: Union[float, np.ndarray], temperature: float = None, label: str = "") -> Union[float, np.ndarray]:
+    if temperature is None:
+        temperature = CALIBRATION_TEMPERATURE
+
+    scalar_input = np.isscalar(probs)
+    probs_arr = np.atleast_1d(np.array(probs, dtype=float))
+
+    before_mean = float(np.mean(probs_arr))
+    before_std = float(np.std(probs_arr))
+    before_min = float(np.min(probs_arr))
+    before_max = float(np.max(probs_arr))
+
+    sharpened = sharpen_probability(probs_arr, temperature=temperature)
+
+    after_mean = float(np.mean(sharpened))
+    after_std = float(np.std(sharpened))
+    after_min = float(np.min(sharpened))
+    after_max = float(np.max(sharpened))
+
+    tag = f"[{label}] " if label else ""
+    logger.info(
+        f"{tag}Calibration sharpening (T={temperature}): "
+        f"BEFORE mean={before_mean:.4f} std={before_std:.4f} min={before_min:.4f} max={before_max:.4f} | "
+        f"AFTER  mean={after_mean:.4f} std={after_std:.4f} min={after_min:.4f} max={after_max:.4f} | "
+        f"separation_delta={abs(after_mean - 0.5) - abs(before_mean - 0.5):+.4f}"
     )
-    return p_new
+
+    if scalar_input:
+        return float(sharpened[0])
+    return sharpened
 
 
-def calibrate(p_raw: float) -> float:
-    """
-    Main calibration entry point.
-    Applies extremization transform to push probabilities away from 0.5,
-    exploiting the model's strong directional accuracy (80.4%) by increasing
-    separation without degrading directional signal.
-    """
-    logger.critical(f"CALIBRATOR_HIT raw={p_raw:.4f}")
+class Calibrator:
+    def __init__(self, temperature: float = None):
+        self.temperature = temperature if temperature is not None else CALIBRATION_TEMPERATURE
+        logger.info(f"Calibrator initialized with temperature={self.temperature}")
 
-    k = CALIBRATION_EXTREMIZE_FACTOR
+    def calibrate(self, probs: Union[float, np.ndarray], label: str = "") -> Union[float, np.ndarray]:
+        try:
+            return calibrate_probabilities(probs, temperature=self.temperature, label=label)
+        except Exception as exc:
+            logger.error(f"Calibration failed ({exc}), returning original probabilities")
+            return probs
 
-    if k <= 0:
-        logger.warning(
-            f"CALIBRATION_EXTREMIZE_FACTOR={k} is invalid (must be > 0), "
-            f"skipping extremization"
-        )
-        return p_raw
-
-    p_calibrated = extremize(p_raw, k)
-
-    logger.critical(
-        f"CALIBRATOR_RESULT raw={p_raw:.4f} calibrated={p_calibrated:.4f} "
-        f"delta={p_calibrated - p_raw:+.4f} k={k}"
-    )
-
-    return p_calibrated
+    def set_temperature(self, temperature: float):
+        logger.info(f"Calibrator temperature updated: {self.temperature} -> {temperature}")
+        self.temperature = temperature
 
 
-def calibrate_batch(probabilities: list) -> list:
-    """
-    Apply calibration to a list of raw probabilities.
-    Returns list of calibrated probabilities in the same order.
-    """
-    return [calibrate(p) for p in probabilities]
+_default_calibrator = Calibrator()
+
+
+def apply_calibration(probs: Union[float, np.ndarray], label: str = "") -> Union[float, np.ndarray]:
+    return _default_calibrator.calibrate(probs, label=label)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    test_probs = np.array([0.42, 0.45, 0.50, 0.55, 0.58, 0.60, 0.70, 0.30])
+    print("Input probabilities:", test_probs)
+    sharpened = apply_calibration(test_probs, label="selftest")
+    print("Sharpened probabilities:", sharpened)
+    for p_in, p_out in zip(test_probs, sharpened):
+        print(f"  {p_in:.3f} -> {p_out:.3f}  (delta={p_out - p_in:+.3f})")
