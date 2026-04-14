@@ -1,130 +1,97 @@
-import logging
 import math
+import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-BASE_RATES = {
-    "politics": 0.52,
-    "economics": 0.48,
-    "tech": 0.55,
-    "sports": 0.50,
-    "science": 0.50,
-    "finance": 0.48,
-    "health": 0.51,
-    "environment": 0.49,
-    "entertainment": 0.50,
-    "military": 0.51,
-}
-
-STRONG_CATEGORIES = {"politics", "economics", "tech"}
-N_PRIOR_STRONG = 20
-N_PRIOR_WEAK = 10
+CALIBRATION_SHARPNESS = 1.75
 
 
-def sharpen(p: float, k: float = 1.5) -> float:
+def _sharpen(p: float, k: float = CALIBRATION_SHARPNESS) -> float:
+    """
+    Apply logit-space sharpening to push probabilities away from 0.5.
+
+    Steps:
+      1. Clip p to avoid log(0) or log(inf)
+      2. Convert to logit space: logit = log(p / (1 - p))
+      3. Stretch: stretched_logit = k * logit
+      4. Convert back: p_sharp = 1 / (1 + exp(-stretched_logit))
+      5. Clamp to [0.04, 0.96] to avoid extreme probabilities
+
+    Monotonic transform: preserves rank ordering / accuracy.
+    """
     p = float(p)
-    p = max(1e-9, min(1 - 1e-9, p))
-    pk = p ** k
-    qk = (1.0 - p) ** k
-    denom = pk + qk
-    if denom == 0 or math.isnan(denom) or math.isinf(denom):
-        return p
-    result = pk / denom
-    if math.isnan(result) or math.isinf(result):
-        return p
-    return float(result)
+    p = max(1e-9, min(1.0 - 1e-9, p))
 
+    logit = math.log(p / (1.0 - p))
+    stretched_logit = k * logit
+    p_sharp = 1.0 / (1.0 + math.exp(-stretched_logit))
 
-def get_base_rate(category: str) -> float:
-    if category is None:
-        return 0.5
-    return BASE_RATES.get(category.lower().strip(), 0.5)
-
-
-def get_n_prior(category: str) -> int:
-    if category is None:
-        return N_PRIOR_WEAK
-    if category.lower().strip() in STRONG_CATEGORIES:
-        return N_PRIOR_STRONG
-    return N_PRIOR_WEAK
-
-
-def bayesian_update(p_sharp: float, category: str) -> float:
-    base_rate = get_base_rate(category)
-    n_prior = get_n_prior(category)
-    n_evidence = 1
-    p_final = (n_prior * base_rate + n_evidence * p_sharp) / (n_prior + n_evidence)
-    return float(p_final)
-
-
-def count_feature_agreement(signals: list) -> int:
-    if not signals:
-        return 0
-    positive = sum(1 for s in signals if s > 0.5)
-    negative = sum(1 for s in signals if s <= 0.5)
-    return max(positive, negative)
+    p_sharp = max(0.04, min(0.96, p_sharp))
+    return p_sharp
 
 
 def calibrate(
-    raw_prob: float,
-    category: str = None,
-    signals: list = None,
-    k: float = 1.5,
+    raw_p: float,
+    sharpness: Optional[float] = None,
 ) -> float:
-    if signals is None:
-        signals = []
+    """
+    Full calibration pipeline:
+      1. Validate / clip raw probability
+      2. (Placeholder for any isotonic / Platt scaling already in use)
+      3. Apply logit-space sharpening
+      4. Return final calibrated probability
 
-    raw_prob = float(raw_prob)
-    if math.isnan(raw_prob) or math.isinf(raw_prob):
-        logger.warning("calibrate received invalid raw_prob=%s, defaulting to 0.5", raw_prob)
-        raw_prob = 0.5
+    Args:
+        raw_p:     Raw model output probability in [0, 1].
+        sharpness: Override for CALIBRATION_SHARPNESS (k factor).
+                   Pass None to use the module-level default.
 
-    raw_prob = max(0.0, min(1.0, raw_prob))
+    Returns:
+        Calibrated, sharpened probability in [0.04, 0.96].
+    """
+    k = sharpness if sharpness is not None else CALIBRATION_SHARPNESS
 
-    agreement_score = count_feature_agreement(signals)
-    n_signals = len(signals)
-    sharpening_eligible = agreement_score >= 3 if n_signals > 0 else False
+    # --- Step 1: basic validation ---
+    raw_p = float(raw_p)
+    if not math.isfinite(raw_p):
+        logger.warning(
+            "calibrate() received non-finite raw_p=%s; defaulting to 0.5", raw_p
+        )
+        raw_p = 0.5
+
+    raw_p = max(1e-9, min(1.0 - 1e-9, raw_p))
+
+    # --- Step 2: existing calibration (identity pass-through placeholder) ---
+    # Insert any Platt / isotonic scaling here if/when available.
+    calibrated_p = raw_p
+
+    # --- Step 3: logit-space sharpening ---
+    p_sharp = _sharpen(calibrated_p, k=k)
 
     logger.info(
-        "pre_sharpen prob=%.4f category=%s signals=%d agreement=%d eligible=%s",
-        raw_prob,
-        category,
-        n_signals,
-        agreement_score,
-        sharpening_eligible,
-    )
-
-    if sharpening_eligible:
-        p_sharp = sharpen(raw_prob, k=k)
-    else:
-        p_sharp = raw_prob
-
-    logger.info(
-        "post_sharpen prob=%.4f (delta=%.4f) sharpening_applied=%s",
+        "CALIBRATE: raw=%.6f -> calibrated=%.6f -> sharp=%.6f (k=%.3f)",
+        raw_p,
+        calibrated_p,
         p_sharp,
-        p_sharp - raw_prob,
-        sharpening_eligible,
+        k,
     )
 
-    p_final = bayesian_update(p_sharp, category)
-
-    p_final = max(0.05, min(0.95, p_final))
-
-    logger.info(
-        "final_calibrated prob=%.4f category=%s base_rate=%.4f n_prior=%d",
-        p_final,
-        category,
-        get_base_rate(category),
-        get_n_prior(category),
-    )
-
-    return p_final
+    return p_sharp
 
 
 def calibrate_batch(
-    predictions: list,
-    category: str = None,
-    signals: list = None,
-    k: float = 1.5,
+    raw_probs: list,
+    sharpness: Optional[float] = None,
 ) -> list:
-    return [calibrate(p, category=category, signals=signals, k=k) for p in predictions]
+    """
+    Convenience wrapper: calibrate a list of raw probabilities.
+
+    Args:
+        raw_probs: Iterable of raw model probabilities.
+        sharpness: Optional k override passed through to calibrate().
+
+    Returns:
+        List of calibrated, sharpened probabilities.
+    """
+    return [calibrate(p, sharpness=sharpness) for p in raw_probs]
