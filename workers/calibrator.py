@@ -1,163 +1,81 @@
-import logging
-import math
+import numpy as np
+from typing import Optional
 
-logger = logging.getLogger(__name__)
-
-# Configurable sharpness parameter for power-law sharpening
-# k=1.0 is identity, k>1 pushes probabilities away from 0.5
-# Future RL iterations can tune this value
-CALIBRATION_SHARPNESS = 1.8
-
-# Minimum distance from center threshold to avoid low-conviction noise
-NO_TRADE_ZONE_THRESHOLD = 0.04
-
-# Clamp bounds to avoid overconfidence
-OUTPUT_CLAMP_MIN = 0.05
-OUTPUT_CLAMP_MAX = 0.95
+CONFIDENCE_EXPANSION_ENABLED = True
 
 
-def sharpen_probability(p: float, k: float = CALIBRATION_SHARPNESS) -> float:
-    """
-    Apply power-law sharpening transformation to a probability.
-    
-    p_sharp = p^k / (p^k + (1-p)^k)
-    
-    This is monotonic and preserves rank ordering while increasing separation.
-    k=1.0 is identity, k>1 pushes probabilities away from 0.5.
-    
-    Examples with k=1.8:
-        p=0.60 -> ~0.65
-        p=0.40 -> ~0.35
-        p=0.70 -> ~0.77
-        p=0.30 -> ~0.23
-    """
-    if k == 1.0:
+class Calibrator:
+    def __init__(self, method: str = "isotonic"):
+        self.method = method
+        self.model = None
+        self._is_fitted = False
+
+    def fit(self, probs: np.ndarray, labels: np.ndarray) -> None:
+        from sklearn.isotonic import IsotonicRegression
+        from sklearn.linear_model import LogisticRegression
+
+        if self.method == "isotonic":
+            self.model = IsotonicRegression(out_of_bounds="clip")
+            self.model.fit(probs, labels)
+        elif self.method == "platt":
+            self.model = LogisticRegression()
+            self.model.fit(probs.reshape(-1, 1), labels)
+        else:
+            raise ValueError(f"Unknown calibration method: {self.method}")
+
+        self._is_fitted = True
+
+    def predict(self, probs: np.ndarray) -> np.ndarray:
+        if not self._is_fitted or self.model is None:
+            return probs
+
+        if self.method == "isotonic":
+            return self.model.predict(probs)
+        elif self.method == "platt":
+            return self.model.predict_proba(probs.reshape(-1, 1))[:, 1]
+        return probs
+
+    def calibrate(self, raw_prob: float, signals: Optional[dict] = None) -> float:
+        p = float(raw_prob)
+        p = max(0.0, min(1.0, p))
+
+        if self._is_fitted and self.model is not None:
+            arr = np.array([p])
+            p = float(self.predict(arr)[0])
+
+        p = max(0.0, min(1.0, p))
+
+        if CONFIDENCE_EXPANSION_ENABLED and signals is not None and len(signals) > 0:
+            p = self._apply_confidence_expansion(p, signals)
+
         return p
-    
-    # Guard against edge cases
-    if p <= 0.0:
-        return 0.0
-    if p >= 1.0:
-        return 1.0
-    
-    p_k = p ** k
-    q_k = (1.0 - p) ** k
-    denominator = p_k + q_k
-    
-    if denominator == 0.0:
-        return 0.5
-    
-    return p_k / denominator
 
+    def _apply_confidence_expansion(self, p: float, signals: dict) -> float:
+        direction = 1 if p >= 0.5 else -1
 
-def apply_no_trade_zone(p: float, threshold: float = NO_TRADE_ZONE_THRESHOLD) -> float:
-    """
-    Snap probabilities close to 0.5 to exactly 0.5 to avoid low-conviction noise.
-    
-    If abs(p - 0.5) < threshold, return 0.5 exactly.
-    This creates a no-trade zone for weak signals.
-    """
-    if abs(p - 0.5) < threshold:
-        return 0.5
-    return p
+        concordant_count = 0
+        for key, value in signals.items():
+            try:
+                signal_val = float(value)
+            except (TypeError, ValueError):
+                continue
 
+            if direction == 1 and signal_val >= 0.5:
+                concordant_count += 1
+            elif direction == -1 and signal_val < 0.5:
+                concordant_count += 1
 
-def clamp_probability(p: float, min_val: float = OUTPUT_CLAMP_MIN, max_val: float = OUTPUT_CLAMP_MAX) -> float:
-    """
-    Clamp probability to [min_val, max_val] to avoid overconfidence.
-    """
-    return max(min_val, min(max_val, p))
+        if concordant_count >= 3:
+            stretch_factor = 1.0 + 0.1 * min(concordant_count, 5)
+            adjusted_p = 0.5 + (p - 0.5) * stretch_factor
+            adjusted_p = max(0.05, min(0.95, adjusted_p))
+            return adjusted_p
 
+        return p
 
-def calibrate(raw_p: float, k: float = CALIBRATION_SHARPNESS) -> float:
-    """
-    Full calibration pipeline:
-    1. Apply power-law sharpening
-    2. Apply no-trade zone snap
-    3. Clamp to safe output range
-    
-    Logs both raw and sharpened probabilities for backtest analysis.
-    
-    Args:
-        raw_p: Raw probability from model, expected in [0, 1]
-        k: Sharpening exponent (default CALIBRATION_SHARPNESS)
-    
-    Returns:
-        Calibrated probability in [OUTPUT_CLAMP_MIN, OUTPUT_CLAMP_MAX]
-        or exactly 0.5 if in no-trade zone
-    """
-    # Step 1: Apply power-law sharpening
-    p_sharp = sharpen_probability(raw_p, k=k)
-    
-    # Step 2: Apply no-trade zone
-    p_no_trade = apply_no_trade_zone(p_sharp)
-    
-    # Step 3: Clamp final output
-    p_final = clamp_probability(p_no_trade)
-    
-    # Log both raw and sharpened for backtest analysis
-    logger.debug(
-        "Calibration pipeline: raw_p=%.4f | sharpened=%.4f | no_trade_zone=%.4f | final=%.4f | k=%.2f",
-        raw_p,
-        p_sharp,
-        p_no_trade,
-        p_final,
-        k,
-    )
-    
-    if p_no_trade == 0.5:
-        logger.debug(
-            "No-trade zone triggered: raw_p=%.4f sharpened=%.4f within %.3f of 0.5",
-            raw_p,
-            p_sharp,
-            NO_TRADE_ZONE_THRESHOLD,
-        )
-    
-    separation_raw = abs(raw_p - 0.5)
-    separation_final = abs(p_final - 0.5)
-    if separation_raw > 0:
-        amplification = separation_final / separation_raw
-        logger.debug(
-            "Separation amplification: raw=%.4f final=%.4f ratio=%.2fx",
-            separation_raw,
-            separation_final,
-            amplification,
-        )
-    
-    return p_final
+    def is_fitted(self) -> bool:
+        return self._is_fitted
 
-
-def calibrate_batch(probabilities: list, k: float = CALIBRATION_SHARPNESS) -> list:
-    """
-    Apply calibration to a batch of probabilities.
-    
-    Args:
-        probabilities: List of raw probabilities
-        k: Sharpening exponent
-    
-    Returns:
-        List of calibrated probabilities
-    """
-    results = []
-    for raw_p in probabilities:
-        results.append(calibrate(raw_p, k=k))
-    
-    # Log batch statistics for analysis
-    if probabilities:
-        raw_separations = [abs(p - 0.5) for p in probabilities]
-        final_separations = [abs(p - 0.5) for p in results]
-        no_trade_count = sum(1 for p in results if p == 0.5)
-        
-        avg_raw_sep = sum(raw_separations) / len(raw_separations)
-        avg_final_sep = sum(final_separations) / len(final_separations)
-        
-        logger.info(
-            "Batch calibration: n=%d | avg_raw_separation=%.4f | avg_final_separation=%.4f | no_trade_count=%d | k=%.2f",
-            len(probabilities),
-            avg_raw_sep,
-            avg_final_sep,
-            no_trade_count,
-            k,
-        )
-    
-    return results
+    def reset(self) -> None:
+        self.model = None
+        self._is_fitted = False
