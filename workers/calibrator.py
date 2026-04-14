@@ -1,143 +1,254 @@
-import numpy as np
 import logging
 import math
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-ALPHA = 1.8
-CONFIDENCE_FLOOR = 0.03
-CLAMP_LOW = 0.05
-CLAMP_HIGH = 0.95
+SHARPEN_ENABLED = True
+
+_SHARPEN_K = {
+    3: 1.3,
+    4: 1.6,
+}
 
 
-def sharpen_probability(p: float, alpha: float = ALPHA) -> float:
+def sharpen_probability(
+    p: float,
+    signal_directions: list[Optional[bool]],
+    label: str = "",
+) -> float:
     """
-    Generalized log-odds scaling (extremizing transform).
+    Conditionally sharpen a probability based on cross-signal agreement.
 
-    Steps:
-        1. logit = log(p / (1 - p))
-        2. scaled_logit = alpha * logit
-        3. p_out = 1 / (1 + exp(-scaled_logit))
+    Parameters
+    ----------
+    p:
+        Calibrated probability in [0, 1].
+    signal_directions:
+        Each element is True (signal favours p>0.5), False (signal favours
+        p<0.5), or None (signal unavailable / inconclusive).
+    label:
+        Arbitrary identifier used in log output for RL tracking.
 
-    This is a monotonic transform that preserves probability ordering.
-    Only applied when abs(p - 0.5) > CONFIDENCE_FLOOR to avoid
-    amplifying noise in near-50/50 predictions.
-    Result is clamped to [CLAMP_LOW, CLAMP_HIGH].
-
-    Args:
-        p: Input probability in (0, 1).
-        alpha: Scaling factor. alpha=1 is identity; alpha>1 sharpens.
-
-    Returns:
-        Sharpened probability, clamped to [CLAMP_LOW, CLAMP_HIGH].
+    Returns
+    -------
+    Sharpened probability clamped to [0.05, 0.95].
     """
-    p_safe = float(np.clip(p, 1e-9, 1 - 1e-9))
+    if not SHARPEN_ENABLED:
+        return p
 
-    if abs(p_safe - 0.5) <= CONFIDENCE_FLOOR:
+    p_original = float(p)
+    p = max(0.0, min(1.0, p_original))
+
+    centre_direction: Optional[bool] = None
+    if p > 0.5:
+        centre_direction = True
+    elif p < 0.5:
+        centre_direction = False
+    else:
+        logger.debug("sharpen_probability[%s]: p=0.5, no sharpening applied", label)
+        return p
+
+    available = [d for d in signal_directions if d is not None]
+    if not available:
         logger.debug(
-            "sharpen_probability: p=%.6f within confidence_floor=%.3f, skipping sharpening",
-            p_safe,
-            CONFIDENCE_FLOOR,
+            "sharpen_probability[%s]: no available signals, skipping sharpening",
+            label,
         )
-        return float(np.clip(p_safe, CLAMP_LOW, CLAMP_HIGH))
+        return p
 
-    logit = math.log(p_safe / (1.0 - p_safe))
-    scaled_logit = alpha * logit
-    p_out = 1.0 / (1.0 + math.exp(-scaled_logit))
-    p_out = float(np.clip(p_out, CLAMP_LOW, CLAMP_HIGH))
+    agreeing = sum(1 for d in available if d == centre_direction)
 
-    logger.debug(
-        "sharpen_probability: p_in=%.6f | logit=%.6f | scaled_logit=%.6f | p_out=%.6f | alpha=%.3f",
-        p_safe,
-        logit,
-        scaled_logit,
-        p_out,
-        alpha,
-    )
+    if agreeing < 3:
+        logger.debug(
+            "sharpen_probability[%s]: agreement=%d < 3, skipping sharpening "
+            "(p=%.4f)",
+            label,
+            agreeing,
+            p,
+        )
+        return p
 
-    return p_out
+    k = _SHARPEN_K.get(min(agreeing, 4), _SHARPEN_K[4])
 
+    sign = 1.0 if p > 0.5 else -1.0
+    deviation = abs(2.0 * (p - 0.5))
 
-def base_calibrate(p: float) -> float:
-    """
-    Base calibration step (isotonic-style clamp + minor regularization).
-    Keeps probabilities away from absolute 0/1 before sharpening.
+    try:
+        sharpened_deviation = math.pow(deviation, 1.0 / k)
+    except (ValueError, ZeroDivisionError):
+        logger.warning(
+            "sharpen_probability[%s]: math error during sharpening, "
+            "returning original p=%.4f",
+            label,
+            p,
+        )
+        return max(0.05, min(0.95, p))
 
-    Args:
-        p: Raw model probability.
+    p_sharp = 0.5 + sign * sharpened_deviation * 0.5
+    p_sharp = max(0.05, min(0.95, p_sharp))
 
-    Returns:
-        Base-calibrated probability in (0, 1).
-    """
-    p_safe = float(np.clip(p, 1e-6, 1 - 1e-6))
-    return p_safe
-
-
-def calibrate(p: float, alpha: float = ALPHA) -> float:
-    """
-    Full calibration pipeline:
-        1. Base calibration (regularization / isotonic correction).
-        2. Sharpening via generalized log-odds scaling (confidence-gated).
-        3. Clamp to [CLAMP_LOW, CLAMP_HIGH].
-
-    This is the entry point wired into the trading brain.
-
-    Args:
-        p: Raw model probability output.
-        alpha: Sharpening strength. Defaults to ALPHA=1.8.
-
-    Returns:
-        Final calibrated-and-sharpened probability.
-    """
-    p_base = base_calibrate(p)
     logger.info(
-        "calibrate: pre_sharpen_p=%.6f (raw_input=%.6f)",
-        p_base,
+        "sharpen_probability[%s]: p_before=%.4f p_after=%.4f "
+        "agreement=%d/%d k=%.1f label=%s",
+        label,
         p,
-    )
-
-    p_sharp = sharpen_probability(p_base, alpha=alpha)
-
-    logger.info(
-        "calibrate: post_sharpen_p=%.6f | delta=%.6f | alpha=%.3f | "
-        "confidence_floor=%.3f | clamped_to=[%.2f, %.2f]",
         p_sharp,
-        p_sharp - p_base,
-        alpha,
-        CONFIDENCE_FLOOR,
-        CLAMP_LOW,
-        CLAMP_HIGH,
+        agreeing,
+        len(available),
+        k,
+        label,
     )
 
     return p_sharp
 
 
-def adjust(p: float, alpha: float = ALPHA) -> float:
+def extremize(p: float, alpha: float = 1.3) -> float:
     """
-    Alias for calibrate(). Provided for compatibility with callers
-    that reference adjust() directly.
-
-    Args:
-        p: Raw model probability.
-        alpha: Sharpening strength.
-
-    Returns:
-        Calibrated-and-sharpened probability.
+    Log-odds extremizing transform. Safe for all p in [0, 1].
+    Fixed point at p=0.5. Alpha>1 sharpens, alpha=1 is identity.
     """
-    return calibrate(p, alpha=alpha)
+    p = float(max(0.02, min(0.98, p)))
+
+    log_odds = math.log(p / (1.0 - p))
+    scaled_log_odds = alpha * log_odds
+
+    try:
+        p_sharp = 1.0 / (1.0 + math.exp(-scaled_log_odds))
+    except OverflowError:
+        p_sharp = 0.02 if scaled_log_odds < 0 else 0.98
+
+    return float(max(0.02, min(0.98, p_sharp)))
 
 
-transform = calibrate
-calibrate_probability = calibrate
+class Calibrator:
+    """
+    Probability calibrator that applies log-odds extremizing followed by
+    optional cross-signal agreement sharpening.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 1.3,
+        sharpen_enabled: Optional[bool] = None,
+    ) -> None:
+        self.alpha = alpha
+        self._sharpen_enabled = (
+            SHARPEN_ENABLED if sharpen_enabled is None else sharpen_enabled
+        )
+
+    def calibrate(
+        self,
+        p: float,
+        signal_directions: Optional[list[Optional[bool]]] = None,
+        label: str = "",
+    ) -> float:
+        """
+        Full calibration pipeline:
+          1. Clip input to a valid range.
+          2. Apply log-odds extremizing (alpha-scaling).
+          3. Apply cross-signal sharpening when signals agree.
+          4. Return clamped probability.
+
+        Parameters
+        ----------
+        p:
+            Raw model probability.
+        signal_directions:
+            Optional list of per-signal direction votes (True / False / None).
+            When omitted or empty the sharpening step is skipped.
+        label:
+            Identifier for log/RL tracking.
+
+        Returns
+        -------
+        Calibrated probability in [0.05, 0.95].
+        """
+        try:
+            p_extremized = extremize(float(p), self.alpha)
+        except Exception as exc:
+            logger.warning(
+                "calibrate[%s]: extremize failed (%s), using clipped raw p",
+                label,
+                exc,
+            )
+            p_extremized = float(max(0.05, min(0.95, p)))
+
+        if signal_directions and self._sharpen_enabled:
+            p_final = sharpen_probability(
+                p_extremized,
+                signal_directions=signal_directions,
+                label=label,
+            )
+        else:
+            p_final = max(0.05, min(0.95, p_extremized))
+
+        logger.debug(
+            "calibrate[%s]: p_raw=%.4f p_extremized=%.4f p_final=%.4f",
+            label,
+            p,
+            p_extremized,
+            p_final,
+        )
+
+        return p_final
+
+    def calibrate_batch(
+        self,
+        probabilities: list[float],
+        signal_directions_batch: Optional[list[Optional[list[Optional[bool]]]]] = None,
+        labels: Optional[list[str]] = None,
+    ) -> list[float]:
+        """
+        Calibrate a list of probabilities.
+
+        Parameters
+        ----------
+        probabilities:
+            Raw model probabilities.
+        signal_directions_batch:
+            One signal_directions list per probability, or None.
+        labels:
+            One label per probability, or None.
+
+        Returns
+        -------
+        List of calibrated probabilities.
+        """
+        n = len(probabilities)
+        sdb = signal_directions_batch or ([None] * n)
+        lbls = labels or ([""] * n)
+
+        results: list[float] = []
+        for idx, (raw_p, sigs, lbl) in enumerate(zip(probabilities, sdb, lbls)):
+            try:
+                results.append(
+                    self.calibrate(raw_p, signal_directions=sigs, label=lbl)
+                )
+            except Exception as exc:
+                logger.error(
+                    "calibrate_batch: error at index %d label=%s: %s",
+                    idx,
+                    lbl,
+                    exc,
+                )
+                results.append(float(max(0.05, min(0.95, raw_p))))
+
+        return results
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-    test_probs = [0.5, 0.51, 0.53, 0.55, 0.60, 0.70, 0.80, 0.90, 0.95,
-                  0.45, 0.40, 0.30, 0.20, 0.10, 0.05]
-    print(f"{'p_in':>8} {'p_base':>8} {'p_sharp':>8} {'delta':>8}")
-    print("-" * 36)
-    for prob in test_probs:
-        p_b = base_calibrate(prob)
-        p_s = calibrate(prob)
-        print(f"{prob:8.4f} {p_b:8.4f} {p_s:8.4f} {p_s - p_b:+8.4f}")
+_default_calibrator = Calibrator()
+
+
+def calibrate(
+    p: float,
+    signal_directions: Optional[list[Optional[bool]]] = None,
+    label: str = "",
+    alpha: float = 1.3,
+) -> float:
+    """
+    Module-level convenience wrapper around Calibrator.calibrate().
+    Creates a one-shot Calibrator with the supplied alpha.
+    """
+    cal = Calibrator(alpha=alpha)
+    return cal.calibrate(p, signal_directions=signal_directions, label=label)
