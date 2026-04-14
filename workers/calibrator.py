@@ -1,176 +1,125 @@
 import math
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-EXTREMIZE_POWER = 0.6
-EXTREMIZE_ENABLED = True
-EXTREMIZE_MIN_THRESHOLD = 0.03
-FINAL_PROB_MIN = 0.05
-FINAL_PROB_MAX = 0.95
+# Shrinkage/blend weight toward prior (reduced by ~50% from original 0.3)
+SHRINKAGE = 0.15
+
+# Sigmoid stretch parameter
+SIGMOID_K = 2.5
+
+# Output probability bounds (widened from [0.15, 0.85])
+OUTPUT_MIN = 0.08
+OUTPUT_MAX = 0.92
+
+# Minimum separation threshold and scale factor
+MIN_SEPARATION = 0.05
+SEPARATION_SCALE = 1.8
 
 
-def extremize_probability(p: float, k: float = EXTREMIZE_POWER) -> float:
+def _sigmoid_stretch(p: float, k: float = SIGMOID_K) -> float:
     """
-    Apply power-law extremization transform.
-    p_ext = 0.5 + sign(p - 0.5) * (|2*(p-0.5)|^k) / 2
+    Apply sigmoid stretching: p_stretched = 1 / (1 + exp(-k * (p - 0.5)))
+    Nonlinearly amplifies deviations from 0.5 while keeping probabilities bounded.
+    Monotonic transform preserving rank ordering.
+    """
+    try:
+        return 1.0 / (1.0 + math.exp(-k * (p - 0.5)))
+    except OverflowError:
+        return 0.0 if p < 0.5 else 1.0
 
-    Pushes confident predictions further from 0.5 to increase separation
-    while preserving calibration direction. Only applied when |p - 0.5|
-    exceeds EXTREMIZE_MIN_THRESHOLD to avoid amplifying noise on near-toss-up
-    predictions.
+
+def _apply_minimum_separation(p: float) -> float:
+    """
+    If abs(p - 0.5) < MIN_SEPARATION, scale deviation by SEPARATION_SCALE
+    to ensure marginal signals clear the gate.
+    Monotonic transform preserving rank ordering.
+    """
+    deviation = p - 0.5
+    if abs(deviation) < MIN_SEPARATION:
+        scaled_deviation = deviation * SEPARATION_SCALE
+        return 0.5 + scaled_deviation
+    return p
+
+
+def calibrate(raw_p: float, prior: float = 0.5, shrinkage: Optional[float] = None) -> float:
+    """
+    Calibrate a raw model probability.
+
+    Steps:
+    1. Blend raw probability toward prior using shrinkage (regression to mean).
+    2. Apply sigmoid stretching to amplify deviations from 0.5.
+    3. Apply minimum separation scaling for marginal signals.
+    4. Clip to allowed output range [OUTPUT_MIN, OUTPUT_MAX].
 
     Args:
-        p: Input probability in [0, 1]
-        k: Power exponent, k < 1 extremizes (pushes toward extremes),
-           k > 1 moderates (pulls toward 0.5)
+        raw_p: Raw model output probability in [0, 1].
+        prior: Prior probability (default 0.5).
+        shrinkage: Override for shrinkage parameter. Defaults to module-level SHRINKAGE.
 
     Returns:
-        Extremized probability clamped to [0, 1]
+        Calibrated probability in [OUTPUT_MIN, OUTPUT_MAX].
     """
-    p = float(p)
-    p = max(0.0, min(1.0, p))
+    if shrinkage is None:
+        shrinkage = SHRINKAGE
 
-    deviation = p - 0.5
+    # Clamp input to valid probability range
+    raw_p = max(0.0, min(1.0, raw_p))
 
-    if abs(deviation) <= EXTREMIZE_MIN_THRESHOLD:
-        logger.debug(
-            "Skipping extremization for p=%.4f (|deviation|=%.4f <= threshold=%.4f)",
-            p, abs(deviation), EXTREMIZE_MIN_THRESHOLD
-        )
-        return p
-
-    sign = 1.0 if deviation > 0 else -1.0
-    abs_scaled = abs(2.0 * deviation)
-
-    try:
-        extremized_magnitude = math.pow(abs_scaled, k)
-    except (ValueError, OverflowError) as e:
-        logger.warning(
-            "extremize_probability math error for p=%.4f, k=%.4f: %s. Returning original.",
-            p, k, e
-        )
-        return p
-
-    p_ext = 0.5 + sign * extremized_magnitude / 2.0
-
-    p_ext = max(0.0, min(1.0, p_ext))
+    # Step 1: Shrinkage / regression-to-mean blend
+    # p_blended = (1 - shrinkage) * raw_p + shrinkage * prior
+    p_blended = (1.0 - shrinkage) * raw_p + shrinkage * prior
 
     logger.debug(
-        "extremize_probability: p=%.4f -> p_ext=%.4f (k=%.2f, deviation=%.4f)",
-        p, p_ext, k, deviation
+        "calibrate: raw_p=%.4f prior=%.4f shrinkage=%.4f -> p_blended=%.4f",
+        raw_p, prior, shrinkage, p_blended,
     )
 
-    return p_ext
+    # Step 2: Sigmoid stretching (amplifies deviations from 0.5)
+    p_stretched = _sigmoid_stretch(p_blended, k=SIGMOID_K)
+
+    logger.debug("calibrate: p_stretched=%.4f", p_stretched)
+
+    # Step 3: Minimum separation check and scaling
+    p_separated = _apply_minimum_separation(p_stretched)
+
+    logger.debug("calibrate: p_separated=%.4f", p_separated)
+
+    # Step 4: Clip to allowed output range
+    p_final = max(OUTPUT_MIN, min(OUTPUT_MAX, p_separated))
+
+    logger.debug("calibrate: p_final=%.4f", p_final)
+
+    return p_final
 
 
-def clamp_probability(p: float,
-                      low: float = FINAL_PROB_MIN,
-                      high: float = FINAL_PROB_MAX) -> float:
+def calibrate_batch(raw_probs: list, prior: float = 0.5, shrinkage: Optional[float] = None) -> list:
     """
-    Clamp probability to [low, high] to prevent overconfidence.
+    Calibrate a batch of raw model probabilities.
 
     Args:
-        p: Input probability
-        low: Minimum allowed probability
-        high: Maximum allowed probability
+        raw_probs: List of raw model output probabilities.
+        prior: Prior probability (default 0.5).
+        shrinkage: Override for shrinkage parameter.
 
     Returns:
-        Clamped probability
+        List of calibrated probabilities.
     """
-    clamped = max(low, min(high, p))
-    if clamped != p:
-        logger.debug(
-            "clamp_probability: clamped %.4f to %.4f (bounds=[%.2f, %.2f])",
-            p, clamped, low, high
-        )
-    return clamped
+    return [calibrate(p, prior=prior, shrinkage=shrinkage) for p in raw_probs]
 
 
-def calibrate_probability(raw_prob: float,
-                          extremize_enabled: bool = EXTREMIZE_ENABLED,
-                          extremize_power: float = EXTREMIZE_POWER) -> float:
+def separation(probs: list) -> float:
     """
-    Full calibration pipeline for a raw model probability.
-
-    Pipeline steps:
-      1. Input validation and clamping to valid [0, 1] range
-      2. Base calibration (placeholder for Platt scaling / isotonic regression
-         or any learned calibration transform applied upstream)
-      3. Extremization via power-law transform (conditional on flag and threshold)
-      4. Final guardrail clamp to [FINAL_PROB_MIN, FINAL_PROB_MAX]
+    Compute mean absolute deviation from 0.5 as a measure of separation.
 
     Args:
-        raw_prob: Raw probability from the model, expected in [0, 1]
-        extremize_enabled: Whether to apply extremization step
-        extremize_power: Exponent k for the extremization transform
+        probs: List of calibrated probabilities.
 
     Returns:
-        Calibrated probability in [FINAL_PROB_MIN, FINAL_PROB_MAX]
+        Mean absolute deviation from 0.5.
     """
-    if not isinstance(raw_prob, (int, float)):
-        logger.error(
-            "calibrate_probability received non-numeric input: %r. Returning 0.5.",
-            raw_prob
-        )
-        return 0.5
-
-    p = float(raw_prob)
-
-    if math.isnan(p) or math.isinf(p):
-        logger.error(
-            "calibrate_probability received nan/inf: %r. Returning 0.5.",
-            raw_prob
-        )
-        return 0.5
-
-    p = max(0.0, min(1.0, p))
-
-    logger.debug("calibrate_probability: raw_prob=%.4f after initial clamp=%.4f", raw_prob, p)
-
-    base_calibrated = p
-
-    if extremize_enabled:
-        extremized = extremize_probability(base_calibrated, k=extremize_power)
-        logger.debug(
-            "calibrate_probability: base_calibrated=%.4f -> extremized=%.4f",
-            base_calibrated, extremized
-        )
-    else:
-        extremized = base_calibrated
-        logger.debug(
-            "calibrate_probability: extremization disabled, keeping %.4f",
-            base_calibrated
-        )
-
-    final = clamp_probability(extremized, low=FINAL_PROB_MIN, high=FINAL_PROB_MAX)
-
-    logger.info(
-        "calibrate_probability: %.4f -> base=%.4f -> extremized=%.4f -> final=%.4f "
-        "(extremize_enabled=%s, k=%.2f)",
-        raw_prob, base_calibrated, extremized, final,
-        extremize_enabled, extremize_power
-    )
-
-    return final
-
-
-def batch_calibrate(raw_probs: list,
-                    extremize_enabled: bool = EXTREMIZE_ENABLED,
-                    extremize_power: float = EXTREMIZE_POWER) -> list:
-    """
-    Apply calibration pipeline to a list of raw probabilities.
-
-    Args:
-        raw_probs: List of raw model probabilities
-        extremize_enabled: Whether to apply extremization
-        extremize_power: Exponent k for extremization
-
-    Returns:
-        List of calibrated probabilities
-    """
-    return [
-        calibrate_probability(p, extremize_enabled=extremize_enabled,
-                              extremize_power=extremize_power)
-        for p in raw_probs
-    ]
+    if not probs:
+        return 0.0
+    return sum(abs(p - 0.5) for p in probs) / len(probs)
