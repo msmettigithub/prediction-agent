@@ -1,152 +1,151 @@
+workers/calibrator.py
 import logging
 import numpy as np
+from typing import Union, List, Optional
 
 logger = logging.getLogger(__name__)
 
 
-def extremize_probability(p: float, alpha: float = 1.5) -> float:
+def sharpen(
+    p: float,
+    n_agreeing_signals: int,
+    clip_low: float = 0.05,
+    clip_high: float = 0.95,
+) -> float:
     """
-    Extremization transform: p_ext = p^alpha / (p^alpha + (1-p)^alpha)
+    Apply symmetric power-law sharpening to a raw probability.
 
-    For alpha > 1, pushes probabilities away from 0.5.
-    For alpha = 1, identity transform.
-    For alpha < 1, shrinks toward 0.5.
+    The sharpening exponent k is computed as:
+        k = 1.0 + 0.3 * (n_agreeing_signals - 1), capped at 2.5
 
-    Examples with alpha=1.5:
-      p=0.65 -> ~0.72
-      p=0.35 -> ~0.28
-      p=0.50 -> 0.50 (fixed point)
+    The transform is:
+        p_out = p^k / (p^k + (1-p)^k)
+
+    This is monotonic and symmetric around 0.5, so it:
+      - Preserves calibration rank-ordering
+      - Never flips a prediction (p > 0.5 stays > 0.5)
+      - Only amplifies existing confidence proportionally to signal agreement
+
+    Args:
+        p: Raw probability in (0, 1).
+        n_agreeing_signals: Number of independent signals agreeing on direction
+            (i.e., all above 0.5 or all below 0.5).
+        clip_low: Lower safety clip bound. Defaults to 0.05.
+        clip_high: Upper safety clip bound. Defaults to 0.95.
+
+    Returns:
+        Sharpened probability clipped to [clip_low, clip_high].
+
+    Examples:
+        With k=1.6 (3 agreeing signals):
+            p=0.60 -> ~0.64
+            p=0.70 -> ~0.77
+            p=0.55 -> ~0.57
+            p=0.50 ->  0.50  (unchanged by symmetry)
     """
-    p = float(np.clip(p, 1e-9, 1 - 1e-9))
-    p_alpha = p ** alpha
-    q_alpha = (1.0 - p) ** alpha
-    p_ext = p_alpha / (p_alpha + q_alpha)
-    return float(p_ext)
+    p_in = float(p)
+
+    # Compute sharpening exponent, capped at 2.5
+    k = 1.0 + 0.3 * (n_agreeing_signals - 1)
+    k = min(k, 2.5)
+
+    # Guard against degenerate inputs before raising to a power
+    p_clipped = float(np.clip(p_in, 1e-9, 1.0 - 1e-9))
+
+    pk = p_clipped ** k
+    one_minus_pk = (1.0 - p_clipped) ** k
+    denom = pk + one_minus_pk
+
+    if denom == 0.0:
+        # Should never happen given the clip above, but be safe
+        p_sharp = p_clipped
+    else:
+        p_sharp = pk / denom
+
+    # Safety clip
+    p_out = float(np.clip(p_sharp, clip_low, clip_high))
+
+    logger.debug(
+        "sharpen: p_in=%.4f n_agreeing=%d k=%.2f p_sharp=%.4f p_out=%.4f",
+        p_in,
+        n_agreeing_signals,
+        k,
+        p_sharp,
+        p_out,
+    )
+
+    return p_out
+
+
+def count_agreeing_signals(signals: List[Optional[float]]) -> int:
+    """
+    Count the number of signals that agree on direction (all above or all below 0.5).
+
+    Signals that are exactly 0.5 or None are treated as neutral and excluded
+    from the agreement count.
+
+    Args:
+        signals: List of probability-like signal values in [0, 1] or None.
+
+    Returns:
+        Number of non-neutral signals that share the majority direction.
+        Returns 1 if there is no agreement (or no valid signals), so that
+        the sharpening exponent defaults to k=1.0 (identity transform).
+    """
+    valid = [s for s in signals if s is not None and s != 0.5]
+
+    if not valid:
+        return 1
+
+    n_above = sum(1 for s in valid if s > 0.5)
+    n_below = sum(1 for s in valid if s < 0.5)
+
+    # Majority direction count
+    agreeing = max(n_above, n_below)
+
+    # If perfectly split, no agreement — default to 1
+    if n_above == n_below:
+        return 1
+
+    return agreeing
 
 
 def calibrate(
-    raw_probability: float,
-    base_rate: float = 0.5,
-    base_rate_weight: float = 0.15,
-    extremize_alpha: float = 1.5,
-    extremize_min_confidence: float = 0.03,
-    output_clamp_low: float = 0.05,
-    output_clamp_high: float = 0.95,
+    raw_prob: float,
+    signals: Optional[List[Optional[float]]] = None,
 ) -> float:
     """
-    Full calibration pipeline:
+    Calibrate a raw probability by applying signal-agreement-based sharpening.
 
-    1. Clamp raw input to avoid degenerate values.
-    2. Bayesian shrinkage toward base rate.
-    3. Extremization step (if |p - 0.5| > extremize_min_confidence).
-    4. Clamp output to [output_clamp_low, output_clamp_high].
+    Steps:
+        1. Count the number of independent signals agreeing on direction.
+        2. Compute sharpening exponent k = 1.0 + 0.3 * (n_agreeing - 1), cap at 2.5.
+        3. Apply symmetric sharpening: p_out = p^k / (p^k + (1-p)^k).
+        4. Clip final output to [0.05, 0.95].
+        5. Log pre/post sharpening values for monitoring.
 
     Args:
-        raw_probability: Model's raw probability estimate in [0, 1].
-        base_rate: Historical base rate for this question type.
-        base_rate_weight: Weight applied to base rate in Bayesian blend (0 = no shrinkage).
-        extremize_alpha: Exponent for the extremization transform (>1 pushes away from 0.5).
-        extremize_min_confidence: Minimum |p - 0.5| required to apply extremization.
-                                  Prevents amplifying noise on truly uncertain questions.
-        output_clamp_low: Lower bound for final output probability.
-        output_clamp_high: Upper bound for final output probability.
+        raw_prob: Raw probability estimate in [0, 1].
+        signals: Optional list of signal values (base rate, trend, sentiment,
+            momentum, etc.) each in [0, 1] or None for missing signals.
+            If None or empty, defaults to no sharpening (k=1.0).
 
     Returns:
-        Calibrated probability in [output_clamp_low, output_clamp_high].
+        Calibrated and sharpened probability in [0.05, 0.95].
     """
-    # --- Stage 0: Sanitize input ---
-    p = float(np.clip(raw_probability, 1e-6, 1 - 1e-6))
-    logger.debug("calibrate: raw_probability=%.6f (clamped=%.6f)", raw_probability, p)
+    if signals is None:
+        signals = []
 
-    # --- Stage 1: Bayesian shrinkage toward base rate ---
-    base_rate = float(np.clip(base_rate, 1e-6, 1 - 1e-6))
-    p_shrunk = (1.0 - base_rate_weight) * p + base_rate_weight * base_rate
-    logger.debug(
-        "calibrate: after shrinkage p=%.6f (base_rate=%.4f, weight=%.4f)",
-        p_shrunk,
-        base_rate,
-        base_rate_weight,
-    )
+    n_agreeing = count_agreeing_signals(signals)
 
-    # --- Stage 2: Extremization ---
-    p_before_ext = p_shrunk
-    deviation = abs(p_before_ext - 0.5)
+    p_out = sharpen(raw_prob, n_agreeing_signals=n_agreeing)
 
-    if deviation > extremize_min_confidence:
-        p_ext = extremize_probability(p_before_ext, alpha=extremize_alpha)
-        logger.info(
-            "calibrate: extremization applied (|p-0.5|=%.4f > threshold=%.4f): "
-            "%.6f -> %.6f (alpha=%.3f)",
-            deviation,
-            extremize_min_confidence,
-            p_before_ext,
-            p_ext,
-            extremize_alpha,
-        )
-    else:
-        p_ext = p_before_ext
-        logger.info(
-            "calibrate: extremization skipped (|p-0.5|=%.4f <= threshold=%.4f): p=%.6f",
-            deviation,
-            extremize_min_confidence,
-            p_before_ext,
-        )
-
-    # --- Stage 3: Clamp output ---
-    p_final = float(np.clip(p_ext, output_clamp_low, output_clamp_high))
     logger.info(
-        "calibrate: final probability=%.6f (pre-clamp=%.6f, clamp=[%.2f, %.2f])",
-        p_final,
-        p_ext,
-        output_clamp_low,
-        output_clamp_high,
+        "CALIBRATE_SHARPENING: raw=%.4f n_signals=%d n_agreeing=%d sharpened=%.4f",
+        raw_prob,
+        len([s for s in signals if s is not None]),
+        n_agreeing,
+        p_out,
     )
 
-    return p_final
-
-
-def batch_calibrate(
-    probabilities: list,
-    base_rate: float = 0.5,
-    base_rate_weight: float = 0.15,
-    extremize_alpha: float = 1.5,
-    extremize_min_confidence: float = 0.03,
-    output_clamp_low: float = 0.05,
-    output_clamp_high: float = 0.95,
-) -> list:
-    """
-    Apply calibrate() to a list of raw probabilities.
-
-    Returns a list of calibrated probabilities in the same order.
-    """
-    results = []
-    for i, p in enumerate(probabilities):
-        try:
-            cal = calibrate(
-                raw_probability=p,
-                base_rate=base_rate,
-                base_rate_weight=base_rate_weight,
-                extremize_alpha=extremize_alpha,
-                extremize_min_confidence=extremize_min_confidence,
-                output_clamp_low=output_clamp_low,
-                output_clamp_high=output_clamp_high,
-            )
-        except Exception as exc:
-            logger.error("batch_calibrate: error at index %d (p=%s): %s", i, p, exc)
-            cal = 0.5
-        results.append(cal)
-
-    raw_arr = np.array(probabilities, dtype=float)
-    cal_arr = np.array(results, dtype=float)
-    logger.info(
-        "batch_calibrate: n=%d  raw mean=%.4f std=%.4f  "
-        "calibrated mean=%.4f std=%.4f  mean_shift=%.4f",
-        len(probabilities),
-        float(np.nanmean(raw_arr)),
-        float(np.nanstd(raw_arr)),
-        float(np.nanmean(cal_arr)),
-        float(np.nanstd(cal_arr)),
-        float(np.nanmean(np.abs(cal_arr - 0.5)) - np.nanmean(np.abs(raw_arr - 0.5))),
-    )
-
-    return results
+    return p_out
