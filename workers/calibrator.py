@@ -1,139 +1,173 @@
-import math
 import logging
+import math
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-ACCURACY_TO_ALPHA = {
-    "high": 0.6,
-    "medium": 0.75,
-    "low": 0.9,
+BASE_RATES = {
+    "geopolitical": 0.15,
+    "economic": 0.35,
+    "tech": 0.60,
+    "sports": 0.50,
+    "political": 0.30,
+    "scientific": 0.45,
+    "social": 0.40,
+    "default": 0.50,
 }
 
-CLAMP_MIN = 0.05
-CLAMP_MAX = 0.95
+DEFAULT_ALPHA = 1.5
+DEFAULT_ANCHOR_WEIGHT = 0.25
+CONFIDENCE_FLOOR = 0.05
 
 
-def get_alpha_from_accuracy(backtest_accuracy: float) -> float:
-    if backtest_accuracy >= 0.80:
-        return ACCURACY_TO_ALPHA["high"]
-    elif backtest_accuracy >= 0.70:
-        return ACCURACY_TO_ALPHA["medium"]
-    else:
-        return ACCURACY_TO_ALPHA["low"]
+def sharpen(p: float, alpha: float = DEFAULT_ALPHA) -> float:
+    """
+    Beta-calibration power sharpening transform.
+    p_sharp = p^alpha / (p^alpha + (1-p)^alpha)
+    Preserves 0.5 as fixed point, pushes values away from center.
+    alpha > 1 increases separation; alpha=1 is identity.
+    """
+    if alpha <= 0:
+        raise ValueError(f"alpha must be positive, got {alpha}")
+    p = max(1e-9, min(1 - 1e-9, p))
+    p_alpha = p ** alpha
+    q_alpha = (1.0 - p) ** alpha
+    denom = p_alpha + q_alpha
+    if denom == 0:
+        return p
+    p_sharp = p_alpha / denom
+    return float(p_sharp)
 
 
-def stretch_probability(p: float, alpha: float) -> float:
-    centered = p - 0.5
-    if centered == 0.0:
-        return 0.5
-    sign = 1.0 if centered > 0 else -1.0
-    abs_double = abs(2.0 * centered)
-    stretched = 0.5 + sign * (abs_double ** alpha) / 2.0
-    return stretched
+def anchor_to_base_rate(
+    p: float,
+    category: str = "default",
+    anchor_weight: float = DEFAULT_ANCHOR_WEIGHT,
+) -> float:
+    """
+    Blend model probability with category-specific historical base rate.
+    p_anchored = (1 - anchor_weight) * p + anchor_weight * base_rate
+    Pulls predictions away from 50/50 for categories with skewed priors.
+    """
+    category_key = category.lower().strip() if category else "default"
+    base_rate = BASE_RATES.get(category_key, BASE_RATES["default"])
+    p_anchored = (1.0 - anchor_weight) * p + anchor_weight * base_rate
+    logger.debug(
+        f"base_rate_anchor: category={category_key}, base_rate={base_rate:.3f}, "
+        f"p_in={p:.4f}, p_anchored={p_anchored:.4f}, anchor_weight={anchor_weight}"
+    )
+    return float(p_anchored)
 
 
-def clamp_probability(p: float) -> float:
-    return max(CLAMP_MIN, min(CLAMP_MAX, p))
+def confidence_floor_check(p: float, floor: float = CONFIDENCE_FLOOR) -> Optional[float]:
+    """
+    Returns None if |p - 0.5| < floor, signaling low-conviction skip.
+    Otherwise returns p unchanged.
+    """
+    distance = abs(p - 0.5)
+    if distance < floor:
+        logger.info(
+            f"confidence_floor: |{p:.4f} - 0.5| = {distance:.4f} < floor={floor:.4f}. "
+            f"Skipping trade (low conviction)."
+        )
+        return None
+    return p
 
 
 def calibrate(
-    raw_probability: float,
-    corroborating_signals: int = 0,
-    backtest_accuracy: float = 0.804,
-    market_price: Optional[float] = None,
-    question_id: Optional[str] = None,
-) -> float:
-    p = float(raw_probability)
-    p = clamp_probability(p)
+    p_raw: float,
+    category: str = "default",
+    alpha: float = DEFAULT_ALPHA,
+    anchor_weight: float = DEFAULT_ANCHOR_WEIGHT,
+    floor: float = CONFIDENCE_FLOOR,
+) -> Optional[float]:
+    """
+    Full calibration pipeline:
+      1. base_rate_anchor  — blend with category prior
+      2. sharpen           — power-law variance expansion
+      3. confidence_floor  — skip low-conviction predictions
 
-    # Existing calibration step: shrink toward market price if available
-    if market_price is not None:
-        blend_weight = 0.7
-        p = blend_weight * p + (1.0 - blend_weight) * market_price
+    Returns calibrated probability, or None if below confidence floor.
+    Logs pre/post probabilities and delta for RL tracking.
+    """
+    p_raw = float(p_raw)
 
-    pre_stretch = p
+    if not (0.0 <= p_raw <= 1.0):
+        raise ValueError(f"p_raw must be in [0, 1], got {p_raw}")
 
-    # Gate: only stretch when evidence is sufficient
-    if corroborating_signals >= 3:
-        alpha = get_alpha_from_accuracy(backtest_accuracy)
-        p_stretched = stretch_probability(p, alpha)
-        p_stretched = clamp_probability(p_stretched)
+    logger.info(f"calibrate_start: p_raw={p_raw:.4f}, category={category}")
 
+    # Step 1: Base-rate anchoring
+    p_anchored = anchor_to_base_rate(p_raw, category=category, anchor_weight=anchor_weight)
+    logger.debug(f"post_anchor: p={p_anchored:.4f}")
+
+    # Step 2: Sharpening
+    p_sharp = sharpen(p_anchored, alpha=alpha)
+    logger.debug(f"post_sharpen: p={p_sharp:.4f}")
+
+    # Step 3: Confidence floor
+    p_final = confidence_floor_check(p_sharp, floor=floor)
+
+    if p_final is None:
+        delta = p_sharp - p_raw
         logger.info(
-            "confidence_stretch",
-            extra={
-                "question_id": question_id,
-                "pre_stretch": pre_stretch,
-                "post_stretch": p_stretched,
-                "alpha": alpha,
-                "backtest_accuracy": backtest_accuracy,
-                "corroborating_signals": corroborating_signals,
-                "stretch_delta": p_stretched - pre_stretch,
-            },
+            f"calibrate_result: p_raw={p_raw:.4f}, p_anchored={p_anchored:.4f}, "
+            f"p_sharp={p_sharp:.4f}, p_final=None (skipped), "
+            f"delta_total={delta:+.4f}, sep_raw={abs(p_raw - 0.5):.4f}, "
+            f"sep_sharp={abs(p_sharp - 0.5):.4f}, "
+            f"sep_improvement={abs(p_sharp - 0.5) - abs(p_raw - 0.5):+.4f}"
         )
+        return None
 
-        return p_stretched
-    else:
-        logger.info(
-            "confidence_stretch_skipped",
-            extra={
-                "question_id": question_id,
-                "pre_stretch": pre_stretch,
-                "post_stretch": pre_stretch,
-                "corroborating_signals": corroborating_signals,
-                "reason": "insufficient_evidence",
-            },
-        )
+    delta_total = p_final - p_raw
+    sep_raw = abs(p_raw - 0.5)
+    sep_final = abs(p_final - 0.5)
+    sep_improvement = sep_final - sep_raw
 
-        return pre_stretch
+    logger.info(
+        f"calibrate_result: p_raw={p_raw:.4f}, p_anchored={p_anchored:.4f}, "
+        f"p_sharp={p_sharp:.4f}, p_final={p_final:.4f}, "
+        f"delta_total={delta_total:+.4f}, sep_raw={sep_raw:.4f}, "
+        f"sep_final={sep_final:.4f}, sep_improvement={sep_improvement:+.4f}"
+    )
+
+    return float(p_final)
 
 
-def calibrate_batch(
+def batch_calibrate(
     predictions: list,
-    backtest_accuracy: float = 0.804,
+    category: str = "default",
+    alpha: float = DEFAULT_ALPHA,
+    anchor_weight: float = DEFAULT_ANCHOR_WEIGHT,
+    floor: float = CONFIDENCE_FLOOR,
 ) -> list:
+    """
+    Calibrate a list of (id, p_raw) tuples.
+    Returns list of (id, p_calibrated) where p_calibrated may be None.
+    """
     results = []
-    for pred in predictions:
-        if isinstance(pred, dict):
-            raw_p = pred.get("probability", 0.5)
-            signals = pred.get("corroborating_signals", 0)
-            market_p = pred.get("market_price", None)
-            qid = pred.get("question_id", None)
+    skipped = 0
+    for item in predictions:
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            pred_id, p_raw = item
         else:
-            raw_p = float(pred)
-            signals = 0
-            market_p = None
-            qid = None
+            pred_id, p_raw = None, item
 
-        calibrated = calibrate(
-            raw_probability=raw_p,
-            corroborating_signals=signals,
-            backtest_accuracy=backtest_accuracy,
-            market_price=market_p,
-            question_id=qid,
+        p_cal = calibrate(
+            p_raw,
+            category=category,
+            alpha=alpha,
+            anchor_weight=anchor_weight,
+            floor=floor,
         )
-        results.append(calibrated)
+        if p_cal is None:
+            skipped += 1
+        results.append((pred_id, p_cal))
 
+    total = len(predictions)
+    placed = total - skipped
+    logger.info(
+        f"batch_calibrate: total={total}, placed={placed}, skipped={skipped}, "
+        f"deploy_rate={placed/total:.2f}" if total > 0 else "batch_calibrate: empty input"
+    )
     return results
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
-    test_cases = [
-        {"probability": 0.62, "corroborating_signals": 5, "question_id": "test_1"},
-        {"probability": 0.58, "corroborating_signals": 2, "question_id": "test_2"},
-        {"probability": 0.75, "corroborating_signals": 4, "market_price": 0.65, "question_id": "test_3"},
-        {"probability": 0.45, "corroborating_signals": 3, "question_id": "test_4"},
-    ]
-
-    for tc in test_cases:
-        result = calibrate(
-            raw_probability=tc["probability"],
-            corroborating_signals=tc.get("corroborating_signals", 0),
-            backtest_accuracy=0.804,
-            market_price=tc.get("market_price"),
-            question_id=tc.get("question_id"),
-        )
-        print(f"Input: {tc['probability']:.3f} signals={tc.get('corroborating_signals',0)} -> Output: {result:.4f}")
