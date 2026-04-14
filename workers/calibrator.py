@@ -1,232 +1,74 @@
-workers/calibrator.py
-
 import math
 import logging
-from typing import Optional
+from config import CALIBRATION_EXTREMIZE_FACTOR
 
 logger = logging.getLogger(__name__)
 
-CATEGORY_K = {
-    "geopolitics": 1.4,
-    "policy": 1.4,
-    "markets": 1.8,
-    "sports": 1.8,
-}
-DEFAULT_K = 1.6
-DEFAULT_CONFIDENCE_FLOOR = 0.12
+EXTREMIZE_MIN_CONFIDENCE = 0.03
 
 
-def stretch_probability(p: float, k: float = DEFAULT_K) -> float:
+def extremize(p: float, k: float) -> float:
     """
-    Power-law logit transform: p_out = p^k / (p^k + (1-p)^k)
-
-    Pushes probabilities away from 0.5 toward the extremes.
-    k=1.0 is identity. k>1 increases separation. k<1 compresses.
+    Transform probability via log-odds scaling.
+    1. Convert p to log-odds: logit = ln(p/(1-p))
+    2. Multiply logit by extremization factor k > 1
+    3. Convert back: p_new = 1/(1+exp(-k*logit))
+    4. Clamp to [0.05, 0.95] for safety
+    Only applied when |p - 0.5| > EXTREMIZE_MIN_CONFIDENCE.
     """
-    if p <= 0.0:
-        return 0.0
-    if p >= 1.0:
-        return 1.0
-    pk = p ** k
-    qk = (1.0 - p) ** k
-    denom = pk + qk
-    if denom == 0.0:
-        return p
-    return pk / denom
+    p_clamped = max(1e-9, min(1 - 1e-9, p))
+    confidence = abs(p_clamped - 0.5)
 
-
-def apply_confidence_floor(
-    p: float,
-    floor: float = DEFAULT_CONFIDENCE_FLOOR,
-    signal_count: int = 0,
-) -> float:
-    """
-    If the prediction is closer to 0.5 than `floor` and we have enough
-    signals, push it to exactly 0.5 +/- floor (toward the nearer extreme).
-    This prevents weak-signal predictions from cluttering the 0.45-0.55 band.
-    """
-    if signal_count < 2:
-        return p
-    distance = abs(p - 0.5)
-    if distance < floor:
-        if p >= 0.5:
-            return 0.5 + floor
-        else:
-            return 0.5 - floor
-    return p
-
-
-class Calibrator:
-    """
-    Wraps an existing calibration pipeline and adds a confidence-amplification
-    step as the final transform.
-
-    The _calibrated flag makes the sharpening step idempotent: calling
-    calibrate() on an already-calibrated value will not double-stretch it.
-    """
-
-    def __init__(
-        self,
-        k: Optional[float] = None,
-        confidence_floor: float = DEFAULT_CONFIDENCE_FLOOR,
-        category: Optional[str] = None,
-    ):
-        self.confidence_floor = confidence_floor
-        self.category = category
-        if k is not None:
-            self.k = k
-        elif category is not None:
-            self.k = CATEGORY_K.get(category.lower(), DEFAULT_K)
-        else:
-            self.k = DEFAULT_K
-
-        self._calibrated_values: dict = {}
-
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
-
-    def calibrate(
-        self,
-        p: float,
-        signal_count: int = 0,
-        prediction_id: Optional[str] = None,
-        category: Optional[str] = None,
-    ) -> float:
-        """
-        Full calibration pipeline:
-          1. Clamp input to (0, 1)
-          2. (Placeholder) apply any existing base calibration logic here
-          3. Apply confidence floor
-          4. Apply power-law logit stretch
-          5. Log pre/post for RL feedback
-          6. Mark as calibrated (idempotency guard)
-
-        Returns the calibrated probability.
-        """
-        # Idempotency guard
-        if prediction_id is not None and self._calibrated_values.get(prediction_id):
-            logger.debug(
-                "calibrate() called again on already-calibrated prediction_id=%s; "
-                "returning cached value.",
-                prediction_id,
-            )
-            return self._calibrated_values[prediction_id]
-
-        p_raw = float(p)
-        p_clamped = max(1e-6, min(1.0 - 1e-6, p_raw))
-
-        # ----------------------------------------------------------------
-        # Step 1: existing base calibration (identity here — extend as
-        #         needed without touching the sharpening logic below)
-        # ----------------------------------------------------------------
-        p_base = self._base_calibration(p_clamped)
-
-        # ----------------------------------------------------------------
-        # Step 2: confidence floor
-        # ----------------------------------------------------------------
-        p_floored = apply_confidence_floor(
-            p_base,
-            floor=self.confidence_floor,
-            signal_count=signal_count,
+    if confidence <= EXTREMIZE_MIN_CONFIDENCE:
+        logger.debug(
+            f"EXTREMIZE_SKIP: p={p_clamped:.4f} confidence={confidence:.4f} "
+            f"below threshold={EXTREMIZE_MIN_CONFIDENCE}"
         )
+        return p_clamped
 
-        # ----------------------------------------------------------------
-        # Step 3: power-law logit stretch (final step)
-        # ----------------------------------------------------------------
-        effective_k = self._resolve_k(category)
-        p_out = stretch_probability(p_floored, k=effective_k)
+    logit = math.log(p_clamped / (1.0 - p_clamped))
+    scaled_logit = k * logit
+    p_new = 1.0 / (1.0 + math.exp(-scaled_logit))
+    p_new = max(0.05, min(0.95, p_new))
 
-        # ----------------------------------------------------------------
-        # Step 4: log for RL feedback loop
-        # ----------------------------------------------------------------
-        logger.info(
-            "calibration | id=%s category=%s k=%.2f signal_count=%d "
-            "p_raw=%.4f p_base=%.4f p_floored=%.4f p_out=%.4f",
-            prediction_id,
-            category or self.category,
-            effective_k,
-            signal_count,
-            p_raw,
-            p_base,
-            p_floored,
-            p_out,
-        )
-
-        # ----------------------------------------------------------------
-        # Step 5: cache for idempotency
-        # ----------------------------------------------------------------
-        if prediction_id is not None:
-            self._calibrated_values[prediction_id] = p_out
-
-        return p_out
-
-    # alias so callers using .adjust() still work
-    def adjust(
-        self,
-        p: float,
-        signal_count: int = 0,
-        prediction_id: Optional[str] = None,
-        category: Optional[str] = None,
-    ) -> float:
-        return self.calibrate(
-            p,
-            signal_count=signal_count,
-            prediction_id=prediction_id,
-            category=category,
-        )
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _base_calibration(self, p: float) -> float:
-        """
-        Placeholder for any pre-existing calibration logic (isotonic
-        regression lookup, Platt scaling, etc.).  Currently identity.
-        Extend here without touching the sharpening pipeline.
-        """
-        return p
-
-    def _resolve_k(self, category: Optional[str]) -> float:
-        if category is not None:
-            return CATEGORY_K.get(category.lower(), self.k)
-        return self.k
-
-    def clear_cache(self) -> None:
-        """Flush the idempotency cache (e.g. between batches)."""
-        self._calibrated_values.clear()
-
-
-# ---------------------------------------------------------------------------
-# Module-level convenience functions for callers that don't instantiate
-# the class directly
-# ---------------------------------------------------------------------------
-
-def calibrate_probability(
-    p: float,
-    k: float = DEFAULT_K,
-    confidence_floor: float = DEFAULT_CONFIDENCE_FLOOR,
-    signal_count: int = 0,
-    prediction_id: Optional[str] = None,
-    category: Optional[str] = None,
-) -> float:
-    """
-    Stateless convenience wrapper around the full calibration pipeline.
-    No idempotency caching (caller is responsible if needed).
-    """
-    p_clamped = max(1e-6, min(1.0 - 1e-6, float(p)))
-    effective_k = CATEGORY_K.get((category or "").lower(), k) if category else k
-    p_floored = apply_confidence_floor(p_clamped, floor=confidence_floor, signal_count=signal_count)
-    p_out = stretch_probability(p_floored, k=effective_k)
-    logger.info(
-        "calibrate_probability | category=%s k=%.2f signal_count=%d "
-        "p_in=%.4f p_floored=%.4f p_out=%.4f",
-        category,
-        effective_k,
-        signal_count,
-        p_clamped,
-        p_floored,
-        p_out,
+    logger.debug(
+        f"EXTREMIZE: p={p_clamped:.4f} logit={logit:.4f} "
+        f"k={k} scaled_logit={scaled_logit:.4f} p_new={p_new:.4f}"
     )
-    return p_out
+    return p_new
+
+
+def calibrate(p_raw: float) -> float:
+    """
+    Main calibration entry point.
+    Applies extremization transform to push probabilities away from 0.5,
+    exploiting the model's strong directional accuracy (80.4%) by increasing
+    separation without degrading directional signal.
+    """
+    logger.critical(f"CALIBRATOR_HIT raw={p_raw:.4f}")
+
+    k = CALIBRATION_EXTREMIZE_FACTOR
+
+    if k <= 0:
+        logger.warning(
+            f"CALIBRATION_EXTREMIZE_FACTOR={k} is invalid (must be > 0), "
+            f"skipping extremization"
+        )
+        return p_raw
+
+    p_calibrated = extremize(p_raw, k)
+
+    logger.critical(
+        f"CALIBRATOR_RESULT raw={p_raw:.4f} calibrated={p_calibrated:.4f} "
+        f"delta={p_calibrated - p_raw:+.4f} k={k}"
+    )
+
+    return p_calibrated
+
+
+def calibrate_batch(probabilities: list) -> list:
+    """
+    Apply calibration to a list of raw probabilities.
+    Returns list of calibrated probabilities in the same order.
+    """
+    return [calibrate(p) for p in probabilities]
