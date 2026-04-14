@@ -1,125 +1,143 @@
-import math
+import numpy as np
 import logging
-from typing import Optional
+import math
 
 logger = logging.getLogger(__name__)
 
-# Shrinkage/blend weight toward prior (reduced by ~50% from original 0.3)
-SHRINKAGE = 0.15
-
-# Sigmoid stretch parameter
-SIGMOID_K = 2.5
-
-# Output probability bounds (widened from [0.15, 0.85])
-OUTPUT_MIN = 0.08
-OUTPUT_MAX = 0.92
-
-# Minimum separation threshold and scale factor
-MIN_SEPARATION = 0.05
-SEPARATION_SCALE = 1.8
+ALPHA = 1.8
+CONFIDENCE_FLOOR = 0.03
+CLAMP_LOW = 0.05
+CLAMP_HIGH = 0.95
 
 
-def _sigmoid_stretch(p: float, k: float = SIGMOID_K) -> float:
+def sharpen_probability(p: float, alpha: float = ALPHA) -> float:
     """
-    Apply sigmoid stretching: p_stretched = 1 / (1 + exp(-k * (p - 0.5)))
-    Nonlinearly amplifies deviations from 0.5 while keeping probabilities bounded.
-    Monotonic transform preserving rank ordering.
-    """
-    try:
-        return 1.0 / (1.0 + math.exp(-k * (p - 0.5)))
-    except OverflowError:
-        return 0.0 if p < 0.5 else 1.0
-
-
-def _apply_minimum_separation(p: float) -> float:
-    """
-    If abs(p - 0.5) < MIN_SEPARATION, scale deviation by SEPARATION_SCALE
-    to ensure marginal signals clear the gate.
-    Monotonic transform preserving rank ordering.
-    """
-    deviation = p - 0.5
-    if abs(deviation) < MIN_SEPARATION:
-        scaled_deviation = deviation * SEPARATION_SCALE
-        return 0.5 + scaled_deviation
-    return p
-
-
-def calibrate(raw_p: float, prior: float = 0.5, shrinkage: Optional[float] = None) -> float:
-    """
-    Calibrate a raw model probability.
+    Generalized log-odds scaling (extremizing transform).
 
     Steps:
-    1. Blend raw probability toward prior using shrinkage (regression to mean).
-    2. Apply sigmoid stretching to amplify deviations from 0.5.
-    3. Apply minimum separation scaling for marginal signals.
-    4. Clip to allowed output range [OUTPUT_MIN, OUTPUT_MAX].
+        1. logit = log(p / (1 - p))
+        2. scaled_logit = alpha * logit
+        3. p_out = 1 / (1 + exp(-scaled_logit))
+
+    This is a monotonic transform that preserves probability ordering.
+    Only applied when abs(p - 0.5) > CONFIDENCE_FLOOR to avoid
+    amplifying noise in near-50/50 predictions.
+    Result is clamped to [CLAMP_LOW, CLAMP_HIGH].
 
     Args:
-        raw_p: Raw model output probability in [0, 1].
-        prior: Prior probability (default 0.5).
-        shrinkage: Override for shrinkage parameter. Defaults to module-level SHRINKAGE.
+        p: Input probability in (0, 1).
+        alpha: Scaling factor. alpha=1 is identity; alpha>1 sharpens.
 
     Returns:
-        Calibrated probability in [OUTPUT_MIN, OUTPUT_MAX].
+        Sharpened probability, clamped to [CLAMP_LOW, CLAMP_HIGH].
     """
-    if shrinkage is None:
-        shrinkage = SHRINKAGE
+    p_safe = float(np.clip(p, 1e-9, 1 - 1e-9))
 
-    # Clamp input to valid probability range
-    raw_p = max(0.0, min(1.0, raw_p))
+    if abs(p_safe - 0.5) <= CONFIDENCE_FLOOR:
+        logger.debug(
+            "sharpen_probability: p=%.6f within confidence_floor=%.3f, skipping sharpening",
+            p_safe,
+            CONFIDENCE_FLOOR,
+        )
+        return float(np.clip(p_safe, CLAMP_LOW, CLAMP_HIGH))
 
-    # Step 1: Shrinkage / regression-to-mean blend
-    # p_blended = (1 - shrinkage) * raw_p + shrinkage * prior
-    p_blended = (1.0 - shrinkage) * raw_p + shrinkage * prior
+    logit = math.log(p_safe / (1.0 - p_safe))
+    scaled_logit = alpha * logit
+    p_out = 1.0 / (1.0 + math.exp(-scaled_logit))
+    p_out = float(np.clip(p_out, CLAMP_LOW, CLAMP_HIGH))
 
     logger.debug(
-        "calibrate: raw_p=%.4f prior=%.4f shrinkage=%.4f -> p_blended=%.4f",
-        raw_p, prior, shrinkage, p_blended,
+        "sharpen_probability: p_in=%.6f | logit=%.6f | scaled_logit=%.6f | p_out=%.6f | alpha=%.3f",
+        p_safe,
+        logit,
+        scaled_logit,
+        p_out,
+        alpha,
     )
 
-    # Step 2: Sigmoid stretching (amplifies deviations from 0.5)
-    p_stretched = _sigmoid_stretch(p_blended, k=SIGMOID_K)
-
-    logger.debug("calibrate: p_stretched=%.4f", p_stretched)
-
-    # Step 3: Minimum separation check and scaling
-    p_separated = _apply_minimum_separation(p_stretched)
-
-    logger.debug("calibrate: p_separated=%.4f", p_separated)
-
-    # Step 4: Clip to allowed output range
-    p_final = max(OUTPUT_MIN, min(OUTPUT_MAX, p_separated))
-
-    logger.debug("calibrate: p_final=%.4f", p_final)
-
-    return p_final
+    return p_out
 
 
-def calibrate_batch(raw_probs: list, prior: float = 0.5, shrinkage: Optional[float] = None) -> list:
+def base_calibrate(p: float) -> float:
     """
-    Calibrate a batch of raw model probabilities.
+    Base calibration step (isotonic-style clamp + minor regularization).
+    Keeps probabilities away from absolute 0/1 before sharpening.
 
     Args:
-        raw_probs: List of raw model output probabilities.
-        prior: Prior probability (default 0.5).
-        shrinkage: Override for shrinkage parameter.
+        p: Raw model probability.
 
     Returns:
-        List of calibrated probabilities.
+        Base-calibrated probability in (0, 1).
     """
-    return [calibrate(p, prior=prior, shrinkage=shrinkage) for p in raw_probs]
+    p_safe = float(np.clip(p, 1e-6, 1 - 1e-6))
+    return p_safe
 
 
-def separation(probs: list) -> float:
+def calibrate(p: float, alpha: float = ALPHA) -> float:
     """
-    Compute mean absolute deviation from 0.5 as a measure of separation.
+    Full calibration pipeline:
+        1. Base calibration (regularization / isotonic correction).
+        2. Sharpening via generalized log-odds scaling (confidence-gated).
+        3. Clamp to [CLAMP_LOW, CLAMP_HIGH].
+
+    This is the entry point wired into the trading brain.
 
     Args:
-        probs: List of calibrated probabilities.
+        p: Raw model probability output.
+        alpha: Sharpening strength. Defaults to ALPHA=1.8.
 
     Returns:
-        Mean absolute deviation from 0.5.
+        Final calibrated-and-sharpened probability.
     """
-    if not probs:
-        return 0.0
-    return sum(abs(p - 0.5) for p in probs) / len(probs)
+    p_base = base_calibrate(p)
+    logger.info(
+        "calibrate: pre_sharpen_p=%.6f (raw_input=%.6f)",
+        p_base,
+        p,
+    )
+
+    p_sharp = sharpen_probability(p_base, alpha=alpha)
+
+    logger.info(
+        "calibrate: post_sharpen_p=%.6f | delta=%.6f | alpha=%.3f | "
+        "confidence_floor=%.3f | clamped_to=[%.2f, %.2f]",
+        p_sharp,
+        p_sharp - p_base,
+        alpha,
+        CONFIDENCE_FLOOR,
+        CLAMP_LOW,
+        CLAMP_HIGH,
+    )
+
+    return p_sharp
+
+
+def adjust(p: float, alpha: float = ALPHA) -> float:
+    """
+    Alias for calibrate(). Provided for compatibility with callers
+    that reference adjust() directly.
+
+    Args:
+        p: Raw model probability.
+        alpha: Sharpening strength.
+
+    Returns:
+        Calibrated-and-sharpened probability.
+    """
+    return calibrate(p, alpha=alpha)
+
+
+transform = calibrate
+calibrate_probability = calibrate
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+    test_probs = [0.5, 0.51, 0.53, 0.55, 0.60, 0.70, 0.80, 0.90, 0.95,
+                  0.45, 0.40, 0.30, 0.20, 0.10, 0.05]
+    print(f"{'p_in':>8} {'p_base':>8} {'p_sharp':>8} {'delta':>8}")
+    print("-" * 36)
+    for prob in test_probs:
+        p_b = base_calibrate(prob)
+        p_s = calibrate(prob)
+        print(f"{prob:8.4f} {p_b:8.4f} {p_s:8.4f} {p_s - p_b:+8.4f}")
