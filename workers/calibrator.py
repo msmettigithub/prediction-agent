@@ -1,151 +1,147 @@
-import numpy as np
+import math
 import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Shrinkage/blend parameter reduced by ~50% (was 0.6, now 0.3)
-PRIOR_WEIGHT = 0.3
 
-# Logistic calibration slope multiplier (increased steepness)
-SLOPE_MULTIPLIER = 1.8
-
-# Minimum confidence/edge threshold for deployment (lowered from 0.15 to 0.07)
-MIN_CONFIDENCE_THRESHOLD = 0.07
-
-# Probability band caps (widened from [0.20, 0.80] to [0.10, 0.90])
-PROB_CAP_LOW = 0.10
-PROB_CAP_HIGH = 0.90
-
-
-def shrink_toward_prior(p: float, prior: float = 0.5, weight: float = PRIOR_WEIGHT) -> float:
+def extremize(p: float, k: float = 0.6) -> float:
     """
-    Blend calibrated probability toward prior (0.5).
-    Reduced weight means less shrinkage toward 0.5.
+    Extremization transform: pushes probabilities away from 0.5.
+    p_extreme = 0.5 + sign(p - 0.5) * |2*(p-0.5)|^k / 2
+    k < 1 makes the transform push outward (extremize).
+    k = 1 is identity. k > 1 would shrink toward 0.5.
     """
-    p = float(np.clip(p, 0.0, 1.0))
-    blended = (1.0 - weight) * p + weight * prior
-    return float(np.clip(blended, PROB_CAP_LOW, PROB_CAP_HIGH))
+    p = float(p)
+    delta = p - 0.5
+    if delta == 0.0:
+        return 0.5
+    stretched = math.copysign(abs(2 * delta) ** k / 2, delta)
+    return 0.5 + stretched
 
 
-def logistic_calibrate(raw_score: float, slope: float = 1.0, intercept: float = 0.0) -> float:
+def select_k(agreeing_signal_count: int) -> float:
     """
-    Apply logistic/sigmoid calibration with increased steepness.
-    slope is multiplied by SLOPE_MULTIPLIER to sharpen the curve.
+    Select extremization strength based on number of agreeing signals.
+    More agreeing signals -> more confident -> stronger extremization (lower k).
     """
-    effective_slope = slope * SLOPE_MULTIPLIER
-    z = effective_slope * raw_score + intercept
-    p = 1.0 / (1.0 + np.exp(-z))
-    return float(np.clip(p, PROB_CAP_LOW, PROB_CAP_HIGH))
-
-
-def sharpen_probability(p: float, k: float = SLOPE_MULTIPLIER) -> float:
-    """
-    Power-law extremization in logit space.
-    Pushes probabilities away from 0.5 without flipping direction.
-
-    At k=1.8:
-      p=0.55 -> ~0.598
-      p=0.60 -> ~0.646
-      p=0.65 -> ~0.695
-      p=0.70 -> ~0.743
-    """
-    p = float(np.clip(p, 0.01, 0.99))
-    p_k = p ** k
-    q_k = (1.0 - p) ** k
-    p_sharp = p_k / (p_k + q_k)
-    return float(np.clip(p_sharp, PROB_CAP_LOW, PROB_CAP_HIGH))
+    if agreeing_signal_count >= 3:
+        return 0.5   # strong extremization
+    elif agreeing_signal_count == 2:
+        return 0.65  # moderate extremization
+    else:
+        return 0.85  # mild extremization
 
 
 def calibrate(
     raw_prob: float,
-    slope: float = 1.0,
-    intercept: float = 0.0,
-    signals: Optional[list] = None,
+    agreeing_signal_count: int = 1,
+    k: Optional[float] = None,
+    context: Optional[str] = None,
 ) -> float:
     """
-    Full calibration pipeline:
-      1. Apply logistic calibration with increased steepness
-      2. Apply power-law sharpening
-      3. Apply reduced shrinkage toward 0.5
-      4. Cap within widened band [0.10, 0.90]
+    Calibrate a raw probability using extremization.
 
-    Parameters
-    ----------
-    raw_prob  : raw model probability in (0, 1)
-    slope     : base slope for logistic calibration (will be multiplied by SLOPE_MULTIPLIER)
-    intercept : intercept for logistic calibration
-    signals   : optional list of directional signals for agreement-gated sharpening
+    Args:
+        raw_prob: The aggregated probability before extremization. Should be in [0, 1].
+        agreeing_signal_count: Number of signals agreeing on direction.
+        k: Override for the extremization exponent. If None, selected from signal count.
+        context: Optional label for logging (e.g. market id or symbol).
 
-    Returns
-    -------
-    Calibrated probability in [PROB_CAP_LOW, PROB_CAP_HIGH]
+    Returns:
+        Calibrated probability clamped to [0.05, 0.95].
     """
-    raw_prob = float(np.clip(raw_prob, 0.01, 0.99))
+    raw_prob = float(raw_prob)
 
-    # Step 1: logistic calibration with steeper slope
-    if slope != 1.0 or intercept != 0.0:
-        p = logistic_calibrate(raw_prob, slope=slope, intercept=intercept)
-    else:
-        p = float(np.clip(raw_prob, PROB_CAP_LOW, PROB_CAP_HIGH))
+    # Clamp input to valid range before processing
+    raw_prob_clamped = max(0.0, min(1.0, raw_prob))
+    if raw_prob_clamped != raw_prob:
+        logger.warning(
+            "calibrate: raw_prob %.6f out of [0,1], clamped to %.6f",
+            raw_prob,
+            raw_prob_clamped,
+        )
+    raw_prob = raw_prob_clamped
 
-    # Step 2: signal-agreement-gated sharpening
-    if signals is not None and len(signals) >= 2:
-        signal_variance = float(np.var(signals))
-        # Effective sharpening exponent scales with signal agreement
-        effective_k = 1.0 + (SLOPE_MULTIPLIER - 1.0) * max(0.0, 1.0 - signal_variance / 0.1)
-        p = sharpen_probability(p, k=effective_k)
-    else:
-        p = sharpen_probability(p, k=SLOPE_MULTIPLIER)
+    # Select k
+    if k is None:
+        k = select_k(agreeing_signal_count)
 
-    # Step 3: reduced shrinkage toward prior (was 0.6, now 0.3)
-    p = shrink_toward_prior(p, prior=0.5, weight=PRIOR_WEIGHT)
+    pre_extremization = raw_prob
 
-    # Step 4: enforce widened probability band
-    p = float(np.clip(p, PROB_CAP_LOW, PROB_CAP_HIGH))
+    # Apply extremization
+    post_extremization = extremize(raw_prob, k=k)
 
-    logger.debug(
-        "calibrate: raw=%.4f -> calibrated=%.4f (slope_mult=%.1f, prior_weight=%.2f)",
-        raw_prob,
-        p,
-        SLOPE_MULTIPLIER,
-        PRIOR_WEIGHT,
+    # Clamp output to safety range
+    post_extremization_clamped = max(0.05, min(0.95, post_extremization))
+
+    label = f"[{context}] " if context else ""
+    logger.info(
+        "%scalibrate: agreeing_signals=%d k=%.3f "
+        "pre_extremization=%.6f post_extremization=%.6f clamped=%.6f",
+        label,
+        agreeing_signal_count,
+        k,
+        pre_extremization,
+        post_extremization,
+        post_extremization_clamped,
     )
 
-    return p
-
-
-def has_sufficient_edge(prob: float, threshold: float = MIN_CONFIDENCE_THRESHOLD) -> bool:
-    """
-    Gate check: only deploy when edge (|prob - 0.5|) exceeds threshold.
-    Threshold lowered from 0.15 to 0.07 to allow more deployments.
-    """
-    edge = abs(prob - 0.5)
-    passes = edge >= threshold
+    # RL feedback hook: emit structured log for downstream consumption
     logger.debug(
-        "has_sufficient_edge: prob=%.4f, edge=%.4f, threshold=%.4f, passes=%s",
-        prob,
-        edge,
-        threshold,
-        passes,
+        "RL_FEEDBACK context=%s pre=%.6f post=%.6f k=%.3f signals=%d",
+        context or "unknown",
+        pre_extremization,
+        post_extremization_clamped,
+        k,
+        agreeing_signal_count,
     )
-    return passes
+
+    return post_extremization_clamped
 
 
-def calibrate_and_gate(
-    raw_prob: float,
-    slope: float = 1.0,
-    intercept: float = 0.0,
-    signals: Optional[list] = None,
-    threshold: float = MIN_CONFIDENCE_THRESHOLD,
-) -> tuple[float, bool]:
+def aggregate_and_calibrate(
+    signals: list,
+    context: Optional[str] = None,
+) -> float:
     """
-    Convenience wrapper: calibrate then apply edge gate.
+    Aggregate a list of probability signals (floats in [0,1]) by averaging,
+    count how many agree on direction relative to 0.5, then apply extremization.
 
-    Returns
-    -------
-    (calibrated_prob, should_deploy)
+    Args:
+        signals: List of float probabilities from individual models/features.
+        context: Optional label for logging.
+
+    Returns:
+        Calibrated and extremized probability in [0.05, 0.95].
     """
-    cal_prob = calibrate(raw_prob, slope=slope, intercept=intercept, signals=signals)
-    deploy = has_sufficient_edge(cal_prob, threshold=threshold)
-    return cal_prob, deploy
+    if not signals:
+        logger.warning("aggregate_and_calibrate: empty signals list, returning 0.5")
+        return 0.5
+
+    signals_clamped = [max(0.0, min(1.0, float(s))) for s in signals]
+    aggregated = sum(signals_clamped) / len(signals_clamped)
+
+    # Count agreeing signals: signals on same side of 0.5 as aggregated mean
+    direction_positive = aggregated >= 0.5
+    if direction_positive:
+        agreeing = sum(1 for s in signals_clamped if s >= 0.5)
+    else:
+        agreeing = sum(1 for s in signals_clamped if s < 0.5)
+
+    label = f"[{context}] " if context else ""
+    logger.info(
+        "%saggregate_and_calibrate: n_signals=%d aggregated=%.6f "
+        "direction_positive=%s agreeing=%d",
+        label,
+        len(signals_clamped),
+        aggregated,
+        direction_positive,
+        agreeing,
+    )
+
+    return calibrate(
+        raw_prob=aggregated,
+        agreeing_signal_count=agreeing,
+        context=context,
+    )
