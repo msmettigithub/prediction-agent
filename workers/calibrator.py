@@ -1,154 +1,85 @@
-import numpy as np
 import logging
+import math
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
-def count_concordant_signals(signals: dict) -> int:
-    direction_votes = []
-
-    signal_keys = [
-        "yfinance_prob",
-        "newsapi_prob",
-        "pytrends_prob",
-        "vader_prob",
-        "statsmodels_prob",
-        "pandas_ta_prob",
-    ]
-
-    for key in signal_keys:
-        if key in signals:
-            val = signals[key]
-            if val is not None and not (isinstance(val, float) and np.isnan(val)):
-                try:
-                    direction_votes.append(1 if float(val) > 0.5 else 0)
-                except (TypeError, ValueError):
-                    pass
-
-    if len(direction_votes) == 0:
-        return 0
-
-    up_count = sum(direction_votes)
-    down_count = len(direction_votes) - up_count
-    concordance = max(up_count, down_count)
-    return concordance
+def extremize(p: float, a: float = 1.5) -> float:
+    pa = p ** a
+    one_minus_pa = (1.0 - p) ** a
+    denom = pa + one_minus_pa
+    if denom == 0.0:
+        return p
+    return pa / denom
 
 
-def apply_concordance_stretch(p: float, concordance: int, total_signals: int) -> float:
-    p = float(p)
-    sign = 1.0 if p >= 0.5 else -1.0
-    deviation = abs(p - 0.5)
+def base_rate_anchor(p_model: float, base_rate: float, base_rate_weight: float = 0.30) -> float:
+    return (1.0 - base_rate_weight) * p_model + base_rate_weight * base_rate
 
-    if total_signals == 0:
-        exponent = 1.2
-    elif concordance >= 4:
-        exponent = 0.7
-    elif concordance == 3:
-        exponent = 0.85
+
+def calibrate(
+    p_raw: float,
+    category: Optional[str] = None,
+    base_rates: Optional[dict] = None,
+    exponent: float = 1.5,
+    confidence_threshold: float = 0.08,
+    clamp_low: float = 0.05,
+    clamp_high: float = 0.95,
+) -> float:
+    logger.info(f"CALIBRATE_START: p_raw={p_raw:.4f}, category={category}")
+
+    p = float(p_raw)
+    p = max(0.0, min(1.0, p))
+
+    # Step 1: base_rate_anchor
+    if base_rates is not None and category is not None:
+        base_rate = base_rates.get(category)
+        if base_rate is not None:
+            p_before_anchor = p
+            p = base_rate_anchor(p, base_rate, base_rate_weight=0.30)
+            logger.info(
+                f"CALIBRATE_BASE_RATE_ANCHOR: category={category}, "
+                f"base_rate={base_rate:.4f}, "
+                f"p_before={p_before_anchor:.4f}, p_after={p:.4f}"
+            )
+        else:
+            logger.info(f"CALIBRATE_BASE_RATE_ANCHOR: no base rate found for category={category}, skipping")
     else:
-        exponent = 1.2
+        logger.info("CALIBRATE_BASE_RATE_ANCHOR: skipped (no base_rates or category provided)")
 
-    stretched_deviation = deviation ** exponent
-    p_final = 0.5 + sign * stretched_deviation
-    p_final = float(np.clip(p_final, 0.05, 0.95))
+    p_after_anchor = p
 
-    logger.debug(
-        f"Concordance stretch: p={p:.4f}, concordance={concordance}/{total_signals}, "
-        f"exponent={exponent}, p_final={p_final:.4f}"
+    # Step 2: confidence_gate then extremize
+    signal_strength = abs(p - 0.5)
+    if signal_strength > confidence_threshold:
+        p_before_extremize = p
+        p = extremize(p, a=exponent)
+        logger.info(
+            f"CALIBRATE_EXTREMIZE: signal_strength={signal_strength:.4f} > threshold={confidence_threshold}, "
+            f"exponent={exponent}, p_before={p_before_extremize:.4f}, p_after={p:.4f}"
+        )
+    else:
+        logger.info(
+            f"CALIBRATE_EXTREMIZE: skipped (signal_strength={signal_strength:.4f} <= threshold={confidence_threshold})"
+        )
+
+    p_after_extremize = p
+
+    # Step 3: clamp
+    p_clamped = max(clamp_low, min(clamp_high, p))
+    if p_clamped != p_after_extremize:
+        logger.info(
+            f"CALIBRATE_CLAMP: p_before={p_after_extremize:.4f}, "
+            f"p_after={p_clamped:.4f}, bounds=[{clamp_low}, {clamp_high}]"
+        )
+
+    p = p_clamped
+
+    logger.info(
+        f"CALIBRATE_END: p_raw={p_raw:.4f}, p_after_anchor={p_after_anchor:.4f}, "
+        f"p_after_extremize={p_after_extremize:.4f}, p_final={p:.4f} "
+        f"(delta={p - p_raw:+.4f})"
     )
 
-    return p_final
-
-
-def calibrate(raw_prob: float, signals: Optional[dict] = None) -> float:
-    p = float(np.clip(raw_prob, 1e-6, 1.0 - 1e-6))
-
-    if signals is not None:
-        concordance = count_concordant_signals(signals)
-        total_signals = sum(
-            1
-            for key in [
-                "yfinance_prob",
-                "newsapi_prob",
-                "pytrends_prob",
-                "vader_prob",
-                "statsmodels_prob",
-                "pandas_ta_prob",
-            ]
-            if key in signals
-            and signals[key] is not None
-            and not (isinstance(signals[key], float) and np.isnan(signals[key]))
-        )
-        p = apply_concordance_stretch(p, concordance, total_signals)
-    else:
-        p = float(np.clip(p, 0.05, 0.95))
-
     return p
-
-
-def calibrate_batch(raw_probs: list, signals_list: Optional[list] = None) -> list:
-    if signals_list is None:
-        signals_list = [None] * len(raw_probs)
-
-    if len(signals_list) != len(raw_probs):
-        logger.warning(
-            f"signals_list length {len(signals_list)} != raw_probs length {len(raw_probs)}, "
-            f"padding with None"
-        )
-        signals_list = list(signals_list) + [None] * (len(raw_probs) - len(signals_list))
-
-    return [calibrate(p, s) for p, s in zip(raw_probs, signals_list)]
-
-
-def get_concordance_info(signals: dict) -> dict:
-    signal_keys = [
-        "yfinance_prob",
-        "newsapi_prob",
-        "pytrends_prob",
-        "vader_prob",
-        "statsmodels_prob",
-        "pandas_ta_prob",
-    ]
-
-    available = []
-    for key in signal_keys:
-        if key in signals:
-            val = signals[key]
-            if val is not None and not (isinstance(val, float) and np.isnan(val)):
-                try:
-                    available.append((key, float(val)))
-                except (TypeError, ValueError):
-                    pass
-
-    if len(available) == 0:
-        return {
-            "concordance": 0,
-            "total_signals": 0,
-            "up_votes": 0,
-            "down_votes": 0,
-            "exponent": 1.2,
-            "signal_details": [],
-        }
-
-    direction_votes = [1 if val > 0.5 else 0 for _, val in available]
-    up_count = sum(direction_votes)
-    down_count = len(direction_votes) - up_count
-    concordance = max(up_count, down_count)
-    total_signals = len(available)
-
-    if concordance >= 4:
-        exponent = 0.7
-    elif concordance == 3:
-        exponent = 0.85
-    else:
-        exponent = 1.2
-
-    return {
-        "concordance": concordance,
-        "total_signals": total_signals,
-        "up_votes": up_count,
-        "down_votes": down_count,
-        "exponent": exponent,
-        "signal_details": [(key, val) for key, val in available],
-    }
