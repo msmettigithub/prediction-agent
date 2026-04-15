@@ -1,189 +1,261 @@
-import logging
 import math
-import os
+import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-
-logger.info("CALIBRATOR MODULE LOADED v3.0 - workers/calibrator.py")
-
-CATEGORY_BASE_RATES = {
-    "financial_exceed": 0.65,
-    "financial_below": 0.35,
-    "sports_favorite": 0.60,
-    "election_incumbent": 0.55,
-    "default": 0.50,
-}
-
-BASE_RATE_WEIGHT = 0.25
-DEFAULT_GAMMA = 0.7
-CONCORDANCE_GAMMA = 0.55
-CONCORDANCE_THRESHOLD = 3
-PROB_MIN = 0.05
-PROB_MAX = 0.95
 
 
-def confidence_stretch(p: float, gamma: float = DEFAULT_GAMMA) -> float:
-    p = max(PROB_MIN, min(PROB_MAX, p))
-    centered = p - 0.5
-    sign = 1.0 if centered >= 0 else -1.0
-    abs_centered = abs(centered)
-    stretched = sign * (abs(2 * centered) ** gamma) / 2.0
-    p_adjusted = 0.5 + stretched
-    p_adjusted = max(PROB_MIN, min(PROB_MAX, p_adjusted))
-    return p_adjusted
+def _logit(p: float) -> float:
+    p = max(1e-9, min(1 - 1e-9, p))
+    return math.log(p / (1 - p))
 
 
-def count_signal_concordance(
-    raw_prob: float,
-    yfinance_momentum: Optional[float] = None,
-    pytrends_interest: Optional[float] = None,
-    newsapi_sentiment: Optional[float] = None,
-    statsmodels_trend: Optional[float] = None,
-) -> int:
-    direction = 1 if raw_prob >= 0.5 else -1
-    agreeing = 0
-
-    if yfinance_momentum is not None:
-        signal_dir = 1 if yfinance_momentum >= 0 else -1
-        if signal_dir == direction:
-            agreeing += 1
-
-    if pytrends_interest is not None:
-        signal_dir = 1 if pytrends_interest >= 0.5 else -1
-        if signal_dir == direction:
-            agreeing += 1
-
-    if newsapi_sentiment is not None:
-        signal_dir = 1 if newsapi_sentiment >= 0.0 else -1
-        if signal_dir == direction:
-            agreeing += 1
-
-    if statsmodels_trend is not None:
-        signal_dir = 1 if statsmodels_trend >= 0.0 else -1
-        if signal_dir == direction:
-            agreeing += 1
-
-    return agreeing
+def _sigmoid(x: float) -> float:
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    else:
+        exp_x = math.exp(x)
+        return exp_x / (1.0 + exp_x)
 
 
-def get_base_rate(category: str) -> float:
-    for key in CATEGORY_BASE_RATES:
-        if key in category.lower():
-            return CATEGORY_BASE_RATES[key]
-    return CATEGORY_BASE_RATES["default"]
+class Calibrator:
+    """
+    Converts raw model probabilities into calibrated, deployment-ready probabilities.
 
+    Calibration pipeline:
+      1. Platt scaling (linear transform in logit space)
+      2. Isotonic regression lookup (optional, via table)
+      3. sharpen_probability() — confidence-aware logit scaling
+      4. Clamp to [0.07, 0.93]
+    """
 
-def blend_with_base_rate(p: float, category: str, weight: float = BASE_RATE_WEIGHT) -> float:
-    base_rate = get_base_rate(category)
-    blended = (1.0 - weight) * p + weight * base_rate
-    return blended
+    SHARPEN_CLAMP_LOW = 0.07
+    SHARPEN_CLAMP_HIGH = 0.93
+    SHARPEN_SCALE_BASE = 1.0
+    SHARPEN_SCALE_PER_SIGNAL = 0.1
+    SHARPEN_SCALE_CAP = 1.5
 
+    def __init__(
+        self,
+        platt_a: float = -1.0,
+        platt_b: float = 0.0,
+        isotonic_table: Optional[dict] = None,
+        sharpening_enabled: bool = True,
+    ):
+        """
+        Parameters
+        ----------
+        platt_a : float
+            Slope for Platt scaling in logit space.
+        platt_b : float
+            Intercept for Platt scaling in logit space.
+        isotonic_table : dict or None
+            Optional lookup table {bucket_low: calibrated_prob, ...}.
+        sharpening_enabled : bool
+            Master switch.  Set False in backtests to compare sharpened vs
+            unsharpened without changing any other logic.
+        """
+        self.platt_a = platt_a
+        self.platt_b = platt_b
+        self.isotonic_table = isotonic_table or {}
+        self.sharpening_enabled = sharpening_enabled
 
-def calibrate(
-    raw_prob: float,
-    contract_id: str = "unknown",
-    category: str = "default",
-    yfinance_momentum: Optional[float] = None,
-    pytrends_interest: Optional[float] = None,
-    newsapi_sentiment: Optional[float] = None,
-    statsmodels_trend: Optional[float] = None,
-) -> float:
-    logger.info(
-        "PRE_CALIBRATION contract_id=%s category=%s raw_prob=%.4f "
-        "yfinance_momentum=%s pytrends_interest=%s newsapi_sentiment=%s statsmodels_trend=%s",
-        contract_id,
-        category,
-        raw_prob,
-        yfinance_momentum,
-        pytrends_interest,
-        newsapi_sentiment,
-        statsmodels_trend,
-    )
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    p = max(PROB_MIN, min(PROB_MAX, float(raw_prob)))
+    def calibrate(
+        self,
+        raw_prob: float,
+        base_rate: Optional[float] = None,
+        trend: Optional[float] = None,
+        sentiment: Optional[float] = None,
+        market_data: Optional[float] = None,
+        bypass_sharpening: bool = False,
+    ) -> float:
+        """
+        Full calibration pipeline.
 
-    p_blended = blend_with_base_rate(p, category, weight=BASE_RATE_WEIGHT)
-    logger.info(
-        "AFTER_BASE_RATE_BLEND contract_id=%s p_before=%.4f p_after=%.4f base_rate=%.4f weight=%.2f",
-        contract_id,
-        p,
-        p_blended,
-        get_base_rate(category),
-        BASE_RATE_WEIGHT,
-    )
+        Parameters
+        ----------
+        raw_prob : float
+            Raw model output in [0, 1].
+        base_rate : float or None
+            Base-rate signal (probability in [0, 1]) if available.
+        trend : float or None
+            Trend signal (probability in [0, 1]) if available.
+        sentiment : float or None
+            Sentiment signal (probability in [0, 1]) if available.
+        market_data : float or None
+            Market-data signal (probability in [0, 1]) if available.
+        bypass_sharpening : bool
+            When True, skip the sharpening step regardless of the
+            instance-level ``sharpening_enabled`` flag.  Useful for
+            per-call backtest comparisons.
 
-    concordance_count = count_signal_concordance(
-        raw_prob=p_blended,
-        yfinance_momentum=yfinance_momentum,
-        pytrends_interest=pytrends_interest,
-        newsapi_sentiment=newsapi_sentiment,
-        statsmodels_trend=statsmodels_trend,
-    )
+        Returns
+        -------
+        float
+            Calibrated probability in [0.07, 0.93].
+        """
+        if not (0.0 <= raw_prob <= 1.0):
+            logger.warning("raw_prob %s outside [0,1]; clamping.", raw_prob)
+            raw_prob = max(0.0, min(1.0, raw_prob))
 
-    gamma = CONCORDANCE_GAMMA if concordance_count >= CONCORDANCE_THRESHOLD else DEFAULT_GAMMA
+        # Step 1 — Platt scaling
+        prob = self._platt_scale(raw_prob)
 
-    logger.info(
-        "SIGNAL_CONCORDANCE contract_id=%s concordance_count=%d threshold=%d gamma_selected=%.2f",
-        contract_id,
-        concordance_count,
-        CONCORDANCE_THRESHOLD,
-        gamma,
-    )
+        # Step 2 — Isotonic regression lookup (if table provided)
+        prob = self._isotonic_lookup(prob)
 
-    p_stretched = confidence_stretch(p_blended, gamma=gamma)
+        # Step 3 — Confidence-aware sharpening
+        if self.sharpening_enabled and not bypass_sharpening:
+            prob = self.sharpen_probability(
+                prob,
+                base_rate=base_rate,
+                trend=trend,
+                sentiment=sentiment,
+                market_data=market_data,
+            )
+        else:
+            # Still apply the hard clamp even when sharpening is bypassed
+            prob = max(self.SHARPEN_CLAMP_LOW, min(self.SHARPEN_CLAMP_HIGH, prob))
 
-    p_final = max(PROB_MIN, min(PROB_MAX, p_stretched))
+        logger.debug(
+            "calibrate: raw=%.4f -> final=%.4f (sharpen=%s)",
+            raw_prob,
+            prob,
+            self.sharpening_enabled and not bypass_sharpening,
+        )
+        return prob
 
-    logger.info(
-        "POST_CALIBRATION contract_id=%s raw_prob=%.4f p_blended=%.4f p_stretched=%.4f "
-        "p_final=%.4f gamma=%.2f concordance=%d category=%s",
-        contract_id,
-        raw_prob,
-        p_blended,
-        p_stretched,
-        p_final,
-        gamma,
-        concordance_count,
-        category,
-    )
+    def sharpen_probability(
+        self,
+        calibrated_prob: float,
+        base_rate: Optional[float] = None,
+        trend: Optional[float] = None,
+        sentiment: Optional[float] = None,
+        market_data: Optional[float] = None,
+    ) -> float:
+        """
+        Confidence-aware sharpening in logit space.
 
-    return p_final
+        Algorithm
+        ---------
+        1. Convert *calibrated_prob* to logit space:
+               logit = ln(p / (1 - p))
+        2. Count how many of the (up to 4) independent signals agree with
+           the direction implied by *calibrated_prob* (i.e., the same side
+           of 0.5):
+               n_agreeing = number of signals also > 0.5 if prob > 0.5,
+                            or also < 0.5 if prob < 0.5.
+           Signals that are None (unavailable) are skipped.
+        3. Compute a scaling factor:
+               scale = min(1.0 + 0.1 * n_agreeing, 1.5)
+        4. Multiply the logit by *scale*:
+               sharpened_logit = scale * logit
+        5. Convert back via sigmoid.
+        6. Clamp to [0.07, 0.93].
 
+        Parameters
+        ----------
+        calibrated_prob : float
+            Already-calibrated probability in [0, 1].
+        base_rate, trend, sentiment, market_data : float or None
+            Independent signal probabilities.  Pass None if a signal is
+            not available for this prediction.
 
-def batch_calibrate(contracts: list) -> list:
-    results = []
-    for contract in contracts:
-        contract_id = contract.get("id", "unknown")
-        raw_prob = contract.get("probability", 0.5)
-        category = contract.get("category", "default")
-        yfinance_momentum = contract.get("yfinance_momentum")
-        pytrends_interest = contract.get("pytrends_interest")
-        newsapi_sentiment = contract.get("newsapi_sentiment")
-        statsmodels_trend = contract.get("statsmodels_trend")
+        Returns
+        -------
+        float
+            Sharpened probability in [0.07, 0.93].
+        """
+        calibrated_prob = max(1e-9, min(1 - 1e-9, calibrated_prob))
 
-        calibrated_prob = calibrate(
-            raw_prob=raw_prob,
-            contract_id=contract_id,
-            category=category,
-            yfinance_momentum=yfinance_momentum,
-            pytrends_interest=pytrends_interest,
-            newsapi_sentiment=newsapi_sentiment,
-            statsmodels_trend=statsmodels_trend,
+        # --- Step 1: logit ---
+        logit_val = _logit(calibrated_prob)
+
+        # --- Step 2: count agreeing signals ---
+        direction_above = calibrated_prob > 0.5
+        signals = {
+            "base_rate": base_rate,
+            "trend": trend,
+            "sentiment": sentiment,
+            "market_data": market_data,
+        }
+        n_agreeing = 0
+        for name, sig in signals.items():
+            if sig is None:
+                continue
+            sig_above = sig > 0.5
+            if sig_above == direction_above:
+                n_agreeing += 1
+            logger.debug(
+                "sharpen signal '%s'=%.4f agrees=%s",
+                name,
+                sig,
+                sig_above == direction_above,
+            )
+
+        # --- Step 3: scaling factor ---
+        scale = min(
+            self.SHARPEN_SCALE_BASE + self.SHARPEN_SCALE_PER_SIGNAL * n_agreeing,
+            self.SHARPEN_SCALE_CAP,
         )
 
-        result = dict(contract)
-        result["calibrated_probability"] = calibrated_prob
-        result["raw_probability"] = raw_prob
-        results.append(result)
+        # --- Step 4: scale the logit ---
+        sharpened_logit = scale * logit_val
 
-    logger.info("BATCH_CALIBRATION_COMPLETE total_contracts=%d", len(results))
-    return results
+        # --- Step 5: back to probability ---
+        sharpened_prob = _sigmoid(sharpened_logit)
+
+        # --- Step 6: clamp ---
+        sharpened_prob = max(
+            self.SHARPEN_CLAMP_LOW, min(self.SHARPEN_CLAMP_HIGH, sharpened_prob)
+        )
+
+        logger.debug(
+            "sharpen: p_in=%.4f logit=%.4f n_agree=%d scale=%.2f "
+            "sharpened_logit=%.4f p_out=%.4f",
+            calibrated_prob,
+            logit_val,
+            n_agreeing,
+            scale,
+            sharpened_logit,
+            sharpened_prob,
+        )
+        return sharpened_prob
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _platt_scale(self, prob: float) -> float:
+        """Apply Platt scaling: sigmoid(a * logit(p) + b)."""
+        logit_val = _logit(prob)
+        scaled = self.platt_a * logit_val + self.platt_b
+        result = _sigmoid(scaled)
+        logger.debug("platt_scale: %.4f -> %.4f", prob, result)
+        return result
+
+    def _isotonic_lookup(self, prob: float) -> float:
+        """
+        Optional piecewise-constant isotonic correction.
+
+        The table maps lower-bucket-boundary (float) to corrected probability.
+        If no table is configured the input is returned unchanged.
+        """
+        if not self.isotonic_table:
+            return prob
+
+        # Find the largest bucket key <= prob
+        sorted_keys = sorted(self.isotonic_table.keys())
+        corrected = prob
+        for key in sorted_keys:
+            if prob >= key:
+                corrected = self.isotonic_table[key]
+            else:
+                break
+
+        logger.debug("isotonic_lookup: %.4f -> %.4f", prob, corrected)
+        return corrected
