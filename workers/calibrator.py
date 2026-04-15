@@ -1,149 +1,162 @@
-import math
 import logging
-from typing import Optional, Sequence
+import math
+import os
 
 logger = logging.getLogger(__name__)
 
-CALIBRATOR_STRETCH_ENABLED: bool = True
-CALIBRATOR_STRETCH_FACTOR: float = 1.5
+try:
+    import config
+    CALIBRATION_SHARPNESS = getattr(config, 'CALIBRATION_SHARPNESS', 1.5)
+except ImportError:
+    CALIBRATION_SHARPNESS = 1.5
 
-_FLOOR: float = 0.05
-_CEILING: float = 0.95
-
-
-def _to_logit(p: float) -> float:
-    p = max(1e-9, min(1 - 1e-9, p))
-    return math.log(p / (1.0 - p))
-
-
-def _from_logit(logit: float) -> float:
-    return 1.0 / (1.0 + math.exp(-logit))
+SHARPEN_K = float(os.environ.get('CALIBRATION_SHARPNESS', CALIBRATION_SHARPNESS))
+CLAMP_LOW = 0.04
+CLAMP_HIGH = 0.96
+PRE_LOGIT_CLIP_LOW = 0.02
+PRE_LOGIT_CLIP_HIGH = 0.98
+LOGIT_CAP = 4.0
 
 
-def _concordance_weight(signals: Sequence[float]) -> float:
-    if not signals:
-        return 1.0
-    above = sum(1 for s in signals if s > 0.5)
-    below = sum(1 for s in signals if s < 0.5)
-    total = above + below
-    if total == 0:
-        return 1.0
-    majority = max(above, below)
-    agreement_ratio = majority / total
-    if agreement_ratio >= 1.0:
-        return 1.6
-    elif agreement_ratio >= 0.67:
-        return 1.3
-    else:
-        return 1.0
+def sharpen_probability(p, k=None):
+    if k is None:
+        k = SHARPEN_K
+    try:
+        p_f = float(p)
+    except (TypeError, ValueError):
+        logger.warning("sharpen_probability received non-numeric input: %r, returning 0.5", p)
+        return 0.5
 
+    if not math.isfinite(p_f):
+        logger.warning("sharpen_probability received non-finite input: %r, returning 0.5", p_f)
+        return 0.5
 
-def stretch_probability(
-    p: float,
-    signals: Optional[Sequence[float]] = None,
-    stretch_factor: Optional[float] = None,
-    enabled: Optional[bool] = None,
-) -> float:
-    if enabled is None:
-        enabled = CALIBRATOR_STRETCH_ENABLED
-    if not enabled:
-        return p
+    p_pre = max(PRE_LOGIT_CLIP_LOW, min(PRE_LOGIT_CLIP_HIGH, p_f))
 
-    if stretch_factor is None:
-        stretch_factor = CALIBRATOR_STRETCH_FACTOR
+    try:
+        logit = math.log(p_pre / (1.0 - p_pre))
+    except (ValueError, ZeroDivisionError):
+        logger.warning("logit computation failed for p=%r, returning clamped input", p_pre)
+        return max(CLAMP_LOW, min(CLAMP_HIGH, p_f))
 
-    if signals is None:
-        signals = [p]
+    stretched_logit = k * logit
 
-    concordance = _concordance_weight(signals)
-    logit = _to_logit(p)
-    stretched_logit = logit * stretch_factor * concordance
-    new_p = _from_logit(stretched_logit)
-    new_p = max(_FLOOR, min(_CEILING, new_p))
-    return new_p
+    stretched_logit = max(-LOGIT_CAP, min(LOGIT_CAP, stretched_logit))
 
+    try:
+        p_sharp = 1.0 / (1.0 + math.exp(-stretched_logit))
+    except OverflowError:
+        p_sharp = 0.0 if stretched_logit < 0 else 1.0
 
-def calibrate(
-    raw_probability: float,
-    signals: Optional[Sequence[float]] = None,
-    stretch_factor: Optional[float] = None,
-    enabled: Optional[bool] = None,
-) -> float:
-    pre_stretch_p = float(raw_probability)
-    pre_stretch_p = max(1e-9, min(1 - 1e-9, pre_stretch_p))
-
-    if signals is None:
-        signals = [pre_stretch_p]
-
-    concordance = _concordance_weight(signals)
-    pre_logit = _to_logit(pre_stretch_p)
-
-    logger.debug(
-        "pre_stretch probability=%.6f logit=%.6f concordance_weight=%.2f signal_count=%d",
-        pre_stretch_p,
-        pre_logit,
-        concordance,
-        len(signals),
-    )
-
-    post_stretch_p = stretch_probability(
-        pre_stretch_p,
-        signals=signals,
-        stretch_factor=stretch_factor,
-        enabled=enabled,
-    )
-    post_logit = _to_logit(post_stretch_p)
-    separation_delta = abs(post_stretch_p - 0.5) - abs(pre_stretch_p - 0.5)
+    p_out = max(CLAMP_LOW, min(CLAMP_HIGH, p_sharp))
 
     logger.info(
-        "calibrator_stretch: pre_p=%.6f post_p=%.6f pre_logit=%.6f post_logit=%.6f "
-        "separation_delta=%.6f concordance=%.2f stretch_factor=%.4f enabled=%s",
-        pre_stretch_p,
-        post_stretch_p,
-        pre_logit,
-        post_logit,
-        separation_delta,
-        concordance,
-        stretch_factor if stretch_factor is not None else CALIBRATOR_STRETCH_FACTOR,
-        enabled if enabled is not None else CALIBRATOR_STRETCH_ENABLED,
+        "sharpen_probability: pre_sharpen=%.4f logit=%.4f k=%.2f stretched_logit=%.4f post_sharpen=%.4f",
+        p_f, logit, k, stretched_logit, p_out
     )
 
-    return post_stretch_p
+    return p_out
 
 
-def batch_calibrate(
-    raw_probabilities: Sequence[float],
-    signals_per_prediction: Optional[Sequence[Optional[Sequence[float]]]] = None,
-    stretch_factor: Optional[float] = None,
-    enabled: Optional[bool] = None,
-) -> list:
-    if signals_per_prediction is None:
-        signals_per_prediction = [None] * len(raw_probabilities)
+def calibrate(p, k=None):
+    if k is None:
+        k = SHARPEN_K
+    try:
+        p_f = float(p)
+    except (TypeError, ValueError):
+        logger.warning("calibrate received non-numeric input: %r, returning 0.5", p)
+        return 0.5
 
-    results = []
-    pre_separations = []
-    post_separations = []
+    if not math.isfinite(p_f):
+        logger.warning("calibrate received non-finite input: %r, returning 0.5", p_f)
+        return 0.5
 
-    for i, p in enumerate(raw_probabilities):
-        sigs = signals_per_prediction[i] if i < len(signals_per_prediction) else None
-        pre_sep = abs(p - 0.5)
-        post_p = calibrate(p, signals=sigs, stretch_factor=stretch_factor, enabled=enabled)
-        post_sep = abs(post_p - 0.5)
-        pre_separations.append(pre_sep)
-        post_separations.append(post_sep)
-        results.append(post_p)
+    pre_sharpen = p_f
+    p_out = sharpen_probability(p_f, k=k)
 
-    if pre_separations:
-        mean_pre = sum(pre_separations) / len(pre_separations)
-        mean_post = sum(post_separations) / len(post_separations)
+    logger.info(
+        "calibrate: input=%.4f pre_sharpening=%.4f post_sharpening=%.4f k=%.2f [RL_TRACKING]",
+        p_f, pre_sharpen, p_out, k
+    )
+
+    return p_out
+
+
+def adjust_probability(p, k=None):
+    if k is None:
+        k = SHARPEN_K
+    try:
+        p_f = float(p)
+    except (TypeError, ValueError):
+        logger.warning("adjust_probability received non-numeric input: %r, returning 0.5", p)
+        return 0.5
+
+    if not math.isfinite(p_f):
+        logger.warning("adjust_probability received non-finite input: %r, returning 0.5", p_f)
+        return 0.5
+
+    pre_sharpen = p_f
+    p_out = sharpen_probability(p_f, k=k)
+
+    logger.info(
+        "adjust_probability: input=%.4f pre_sharpening=%.4f post_sharpening=%.4f k=%.2f [RL_TRACKING]",
+        p_f, pre_sharpen, p_out, k
+    )
+
+    return p_out
+
+
+class Calibrator:
+    def __init__(self, k=None):
+        self.k = k if k is not None else SHARPEN_K
+        logger.info("Calibrator initialized with sharpness k=%.2f", self.k)
+
+    def calibrate(self, p):
+        return calibrate(p, k=self.k)
+
+    def adjust_probability(self, p):
+        return adjust_probability(p, k=self.k)
+
+    def sharpen_probability(self, p):
+        return sharpen_probability(p, k=self.k)
+
+    def process(self, p):
+        try:
+            p_f = float(p)
+        except (TypeError, ValueError):
+            logger.warning("Calibrator.process received non-numeric input: %r, returning 0.5", p)
+            return 0.5
+
+        if not math.isfinite(p_f):
+            logger.warning("Calibrator.process received non-finite input: %r, returning 0.5", p_f)
+            return 0.5
+
+        pre_sharpen = p_f
+        p_out = self.sharpen_probability(p_f)
+
         logger.info(
-            "batch_calibrate_metrics: n=%d mean_pre_separation=%.6f mean_post_separation=%.6f "
-            "delta=%.6f pct_increase=%.2f%%",
-            len(results),
-            mean_pre,
-            mean_post,
-            mean_post - mean_pre,
-            100.0 * (mean_post - mean_pre) / max(mean_pre, 1e-9),
+            "Calibrator.process: input=%.4f pre_sharpening=%.4f post_sharpening=%.4f k=%.2f [RL_TRACKING]",
+            p_f, pre_sharpen, p_out, self.k
         )
 
-    return results
+        return p_out
+
+
+_default_calibrator = Calibrator()
+
+
+def process(p):
+    return _default_calibrator.process(p)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    test_cases = [0.45, 0.50, 0.55, 0.60, 0.70, 0.80, 0.90, 0.02, 0.98, 0.0, 1.0]
+    print(f"Sharpness k={SHARPEN_K}")
+    print(f"{'Input':>10} {'Output':>10} {'Delta':>10}")
+    for p in test_cases:
+        try:
+            out = calibrate(p)
+            print(f"{p:>10.4f} {out:>10.4f} {out - p:>+10.4f}")
+        except Exception as e:
+            print(f"{p:>10} ERROR: {e}")
